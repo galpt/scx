@@ -329,7 +329,7 @@ pub struct TaskTelemetryRow {
     pub waker_cpu: u16,  // CPU the waker was running on
     pub waker_tgid: u32, // TGID of the waker (process group)
     // Phase 8: CPU core distribution histogram
-    pub cpu_run_count: [u16; 64], // Per-CPU run count (TUI normalizes to %)
+    pub cpu_run_count: [u16; crate::topology::MAX_CPUS], // Per-CPU run count (TUI normalizes to %)
     // EEVDF telemetry
     pub vtime_mult: u16, // EEVDF vtime reciprocal (1024=nice0, <1024 high-pri, >1024 low-pri)
 }
@@ -392,7 +392,7 @@ impl Default for TaskTelemetryRow {
             quantum_preempt_count: 0,
             waker_cpu: 0,
             waker_tgid: 0,
-            cpu_run_count: [0u16; 64],
+            cpu_run_count: [0u16; crate::topology::MAX_CPUS],
             vtime_mult: 1024,
         }
     }
@@ -402,7 +402,13 @@ fn aggregate_stats(skel: &BpfSkel) -> cake_stats {
     let mut total: cake_stats = Default::default();
 
     if let Some(bss) = &skel.maps.bss_data {
-        for s in &bss.global_stats {
+        // Bound to actual CPU count — at compile-time MAX_CPUS=16,
+        // global_stats.len() is already 16. .take(nr_cpus) further
+        // ensures only populated entries are summed at runtime.
+        let nr = skel.maps.rodata_data.as_ref()
+            .map(|r| r.nr_cpus as usize)
+            .unwrap_or(bss.global_stats.len());
+        for s in bss.global_stats.iter().take(nr) {
             // Sum all fields
             total.nr_new_flow_dispatches += s.nr_new_flow_dispatches;
             total.nr_old_flow_dispatches += s.nr_old_flow_dispatches;
@@ -670,7 +676,11 @@ fn build_cpu_topology_grid_compact<'a>(
         };
 
         // Determine if this LLC has 3D V-Cache
-        let has_vcache = (topo.vcache_llc_mask & (1 << *llc_id)) != 0;
+        let has_vcache = {
+            let word = (*llc_id as usize) >> 6;
+            let bit = 1u64 << ((*llc_id as usize) & 63);
+            word < topo.vcache_llc_mask.len() && (topo.vcache_llc_mask[word] & bit) != 0
+        };
         let vcache_label = if has_vcache { " [3D V-Cache]" } else { "" };
 
         text.push(Line::from(vec![Span::styled(
@@ -686,7 +696,11 @@ fn build_cpu_topology_grid_compact<'a>(
         for chunk in sorted_cpus.chunks(cpus_per_row) {
             let mut line_spans = vec![Span::raw("  ")]; // Indent
             for &cpu in chunk {
-                let is_e_core = (topo.little_core_mask & (1 << cpu)) != 0;
+                let is_e_core = {
+                    let word = cpu >> 6;
+                    let bit = 1u64 << (cpu & 63);
+                    word < topo.little_core_mask.len() && (topo.little_core_mask[word] & bit) != 0
+                };
                 let core_color = if is_e_core {
                     Color::DarkGray
                 } else {

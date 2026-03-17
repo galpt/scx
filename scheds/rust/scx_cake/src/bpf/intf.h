@@ -113,9 +113,52 @@ struct cake_cpu_bss {
  * find-victim = __builtin_ctzll(~game_cpu_mask & online_mask)
  * = single tzcnt instruction on Zen 4 (1-cycle latency). */
 
-#define CAKE_MAX_CPUS 256
-#define CAKE_TELEM_MAX_CPUS 64  /* Telemetry-only: cpu_run_count histogram dimension */
+/* ═══ COMPILE-TIME HARDWARE SCALING (Rule 54) ═══
+ * build.rs detects the host CPU/LLC count from sysfs at compile time,
+ * rounds to next power-of-2, and passes -DCAKE_MAX_CPUS=N -DCAKE_MAX_LLCS=N.
+ * All arrays, loops, BSS, and RODATA compile to exactly the hardware size.
+ *
+ * Power-of-2 required: & (CAKE_MAX_CPUS - 1) bitmask at 50+ indexing sites.
+ * Range [16, 512] covers 4-core old CPUs (clamped up) to dual EPYC.
+ *
+ * Fallback values used when -D not provided (generic/CI builds). */
+#ifndef CAKE_MAX_CPUS
+#define CAKE_MAX_CPUS 64
+#endif
+/* Compile-time validation (BPF compilation only — skipped during Rust bindgen) */
+#ifdef __BPF__
+_Static_assert((CAKE_MAX_CPUS & (CAKE_MAX_CPUS - 1)) == 0,
+               "CAKE_MAX_CPUS must be power of 2");
+_Static_assert(CAKE_MAX_CPUS >= 16 && CAKE_MAX_CPUS <= 512,
+               "CAKE_MAX_CPUS out of range [16, 512]");
+#endif
+
+#ifndef CAKE_MAX_LLCS
 #define CAKE_MAX_LLCS 8
+#endif
+
+/* CPU mask word count: ceiling division for <64 CPU systems.
+ * At 16 CPUs: (16+63)/64 = 1 word.  At 64: 1.  At 512: 8. */
+#define CAKE_CPU_MASK_WORDS ((CAKE_MAX_CPUS + 63) / 64)
+
+/* Auto-size CPU ID type: u8 for ≤256 CPUs (consumer), u16 for >256 (EPYC).
+ * Saves 1 byte per RODATA entry on consumer hardware vs always-u16.
+ * Uses standard C types for bindgen compatibility. */
+#if CAKE_MAX_CPUS <= 256
+typedef unsigned char  cake_cpu_id_t;
+#define CAKE_CPU_SENTINEL 0xFF
+#else
+typedef unsigned short cake_cpu_id_t;
+#define CAKE_CPU_SENTINEL 0xFFFF
+#endif
+
+/* Telemetry histogram: scales with hardware for accurate per-CPU run counts.
+ * At 16 CPUs: 32B/task (16×u16).  At 64: 128B/task.  Compiled out in release. */
+#define CAKE_TELEM_MAX_CPUS CAKE_MAX_CPUS
+
+/* Physical core array sizing: MAX/2 assumes SMT=2 (AMD/Intel consumer).
+ * _Static_assert fires if a non-SMT build exceeds this (future EPYC). */
+#define CAKE_MAX_CORES (CAKE_MAX_CPUS / 2)
 #define CAKE_MAX_AUDIO_TGIDS 8       /* Max tracked audio daemon TGIDs (RODATA) */
 #define CAKE_MAX_COMPOSITOR_TGIDS 4  /* Max tracked compositor TGIDs (RODATA) */
 

@@ -81,39 +81,45 @@ const bool enable_dvfs =
  * Single-CCD (9800X3D): nr_llcs=1, identical to single-DSQ behavior.
  * Multi-CCD (9950X): nr_llcs=2, halves contention, eliminates cross-CCD atomics. */
 const u32 nr_llcs = 1;
-const u32 nr_cpus = 8; /* Set by loader — bounds kick scan loop (Rule 39) */
+const u32 nr_cpus = 1; /* Set by loader. 1 = safe fallback — makes loader failure obvious. */
 const u32 nr_phys_cpus =
-	8; /* Set by loader — physical core count for PHYS_FIRST */
+	1; /* Set by loader. 1 = safe fallback. */
 const u32 nr_nodes = 1; /* Set by loader — NUMA node count for bench competitor */
 const u32 cpu_llc_id[CAKE_MAX_CPUS] = {};
 const u32 cpuperf_cap_table[CAKE_MAX_CPUS] = {}; /* Set by loader — per-CPU max perf */
 
-/* Performance-ordered CPU scan arrays (populated by Rust loader).
- * cpus_fast_to_slow: GAME tasks scan highest-perf cores first → maximum boost.
- * cpus_slow_to_fast: non-GAME tasks scan lowest-perf cores first → power parking.
- * Source: amd_pstate_prefcore_ranking (Zen 4) or cpufreq_cap (fallback).
- * Terminated by 0xFF sentinel when nr_cpus < CAKE_MAX_CPUS. */
-const u8 cpus_fast_to_slow[CAKE_MAX_CPUS] = {};
-const u8 cpus_slow_to_fast[CAKE_MAX_CPUS] = {};
+/* Performance-ordered CPU scan arrays — HYBRID ONLY.
+ * Compiled out on homogeneous AMD SMP (zero RODATA footprint).
+ * cpus_fast_to_slow: GAME tasks scan P-cores first.
+ * cpus_slow_to_fast: non-GAME tasks scan E-cores first. */
+#ifdef CAKE_HAS_HYBRID
+const cake_cpu_id_t cpus_fast_to_slow[CAKE_MAX_CPUS] = {};
+const cake_cpu_id_t cpus_slow_to_fast[CAKE_MAX_CPUS] = {};
+#endif
 
 /* Topological O(1) Arrays — populated by loader */
 const u64 llc_cpu_mask[CAKE_MAX_LLCS]	 = {};
-const u64 core_cpu_mask[32]		 = {};
-const u8  cpu_sibling_map[CAKE_MAX_CPUS] = {};
+const u64 core_cpu_mask[CAKE_MAX_CORES]	 = {};
+const cake_cpu_id_t cpu_sibling_map[CAKE_MAX_CPUS] = {};
 
 /* BSS bench state: xorshift32 PRNG seed */
 u32 bench_xorshift_state = 0xDEADBEEF;
 
-/* F2 FIX: 256-bit CPU mask support for Threadripper/EPYC */
-#define CAKE_CPU_MASK_WORDS (CAKE_MAX_CPUS / 64)
+/* CAKE_CPU_MASK_WORDS defined in intf.h with ceiling division.
+ * At 16 CPUs: 1 word.  At 64: 1.  At 512: 8. */
 
-/* Heterogeneous Routing Masks — u64[4] for 256 CPUs */
+/* Heterogeneous Routing Masks — HYBRID ONLY.
+ * Compiled out on homogeneous AMD SMP (zero mask RODATA). */
+#ifdef CAKE_HAS_HYBRID
 const u64  big_core_phys_mask[CAKE_CPU_MASK_WORDS] = {};
 const u64  big_core_smt_mask[CAKE_CPU_MASK_WORDS]  = {};
 const u64  little_core_mask[CAKE_CPU_MASK_WORDS]   = {};
+#endif
 const u64  vcache_llc_mask[CAKE_CPU_MASK_WORDS]    = {};
 const bool has_vcache	      = false;
+#ifdef CAKE_HAS_HYBRID
 const bool has_hybrid_cores   = false; /* Set by loader — gate for Gate 2 scan */
+#endif
 /* has_cpuperf_control REMOVED: cpuperf 768/1024 scaling was removed.
  * All CPUs run at full speed during GAMING. */
 
@@ -258,7 +264,10 @@ static u8 pid_class_cache[PID_CLASS_CACHE_SIZE];
 static u64 game_cpu_mask[CAKE_CPU_MASK_WORDS];
 
 /* Phase 5: Per-CPU BSS — arena-free running.
- * Each entry is 64B aligned (one cache line per CPU).
+ * Each entry is 128B sector-aligned (Rule 15: V-Cache sector isolation).
+ * FALSE SHARING: impossible — 128B alignment guarantees each CPU
+ * owns its own V-Cache sector on 9800X3D (128B sectors in L3).
+ * At CAKE_MAX_CPUS=16: 2KB total.  Untouched entries stay zero-page COW.
  * running writes, stopping reads (same CPU) + vprot kick reads (remote CPU). */
 struct cake_cpu_bss cpu_bss[CAKE_MAX_CPUS];
 
@@ -1656,8 +1665,10 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
 					    slice, wake_flags);
 			return cpu;
 		}
-		/* !idle: fall through to Gate 2 (hybrid P/E scan). */
+		/* !idle: fall through to Gate 2 (hybrid P/E scan) if available. */
+#ifdef CAKE_HAS_HYBRID
 		goto gate2;
+#endif
 	}
 
 	{
@@ -1683,16 +1694,12 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
 		}
 	}
 
+	/* ── GATE 2: Performance-ordered idle scan (HYBRID ONLY) ──
+	 * Compiled out on homogeneous AMD SMP — verifier never sees this code.
+	 * On Intel hybrid: scan P-cores first for GAME, E-cores first for BG.
+	 * Cost: 0 instructions on SMP (compile-time eliminated). */
+#ifdef CAKE_HAS_HYBRID
 gate2:
-	/* ── GATE 2: Performance-ordered idle scan ──
-	 * Scan CPUs in performance order for idle cores:
-	 *   GAME:     fast→slow (P-cores first for max boost)
-	 *   non-GAME: slow→fast (E-cores first for power parking)
-	 * Uses RODATA cpus_fast_to_slow / cpus_slow_to_fast (populated by
-	 * Rust loader from amd_pstate_prefcore_ranking).
-	 * EEVDF TOPOLOGY: Always active when P/E cores exist, not just GAMING.
-	 * Ensures GAME tasks always land on P-cores, BG on E-cores.
-	 * Cost: 0ns on SMP (has_hybrid_cores=false → JIT eliminates). */
 	if (has_hybrid_cores) {
 		/* READ TASK CLASS from BSS pid_class_cache (tunneled from stopping).
 		 * Zero bpf_task_storage_get → eliminates 1982ns tail jitter.
@@ -1726,6 +1733,7 @@ gate2:
 			}
 		}
 	}
+#endif
 
 	/* ── TUNNEL: All CPUs busy — return prev_cpu ──
 	 * FunSearch: cached_now staging REMOVED (−12 insns).
@@ -2893,17 +2901,18 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
 			return ret;
 	}
 
-	/* Unified per-CPU arena block — conditional sizing.
-	 * RELEASE: 64B/CPU × 64 = 4KB = 1 page (CL0 only, all DCE'd)
-	 * DEBUG:  128B/CPU × 64 = 8KB = 2 pages (CL0 telemetry + CL1 BenchLab)
-	 * Pages rounded up: (CAKE_MBOX_SIZE * CAKE_MAX_CPUS + 4095) / 4096 */
-#ifdef CAKE_RELEASE
-	per_cpu = (struct cake_per_cpu __arena *)bpf_arena_alloc_pages(
-		&arena, NULL, 1, NUMA_NO_NODE, 0);
-#else
-	per_cpu = (struct cake_per_cpu __arena *)bpf_arena_alloc_pages(
-		&arena, NULL, 2, NUMA_NO_NODE, 0);
-#endif
+	/* Unified per-CPU arena block — dynamic sizing (Rule 54: no hardcoded limits).
+	 * Pages = ceil(nr_cpus × CAKE_MBOX_SIZE / 4096).
+	 * 9800X3D (16 CPUs, release): (16×64+4095)/4096 = 1 page — identical to before.
+	 * TR 9980X (256 CPUs, release): (256×64+4095)/4096 = 4 pages.
+	 * nr_cpus is RODATA → JIT constant-folds the arithmetic at load time. */
+	{
+		u32 nr_arena_pages = ((u32)nr_cpus * CAKE_MBOX_SIZE + 4095) / 4096;
+		if (nr_arena_pages < 1)
+			nr_arena_pages = 1;
+		per_cpu = (struct cake_per_cpu __arena *)bpf_arena_alloc_pages(
+			&arena, NULL, nr_arena_pages, NUMA_NO_NODE, 0);
+	}
 	if (!per_cpu)
 		return -ENOMEM;
 
@@ -3090,6 +3099,11 @@ int cake_task_iter(struct bpf_iter__task *ctx)
  * This turns passive "discover work on idle" into proactive "notify idle". */
 void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
 {
+#ifdef CAKE_SINGLE_LLC
+	/* Single-LLC: compile-time eliminated. Verifier sees only `return;`.
+	 * No dead-path analysis of cross-LLC balancing code. */
+	return;
+#else
 	/* Single-LLC: nothing to balance. JIT dead-code eliminates. */
 	if (nr_llcs <= 1)
 		return;
@@ -3125,6 +3139,7 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
 			break;
 		}
 	}
+#endif /* !CAKE_SINGLE_LLC */
 }
 
 /* F6 FIX: Cgroup weight callback — enables framework weight propagation.

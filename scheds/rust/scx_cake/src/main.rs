@@ -291,26 +291,37 @@ impl<'a> Scheduler<'a> {
             // Per-LLC DSQ partitioning: populate CPU→LLC mapping
             let llc_count = topo.llc_cpu_mask.iter().filter(|&&m| m != 0).count() as u32;
             rodata.nr_llcs = llc_count.max(1);
-            rodata.nr_cpus = topo.nr_cpus.min(256) as u32; // F2: widened from 64→256 for Threadripper
-            rodata.nr_phys_cpus = topo.nr_phys_cpus.min(256) as u32; // V3: PHYS_FIRST scan mask
+            rodata.nr_cpus = topo.nr_cpus.min(topology::MAX_CPUS) as u32;
+            rodata.nr_phys_cpus = topo.nr_phys_cpus.min(topology::MAX_CPUS) as u32;
 
-            // Ferry explicit 64-bit topology arrays down into BPF (O(1) execution replacements)
+            // Ferry topology arrays into BPF RODATA — compile-time scaled
 
-            // Heterogeneous Gaming Topology — u64[4] arrays (F2: 256-bit masks)
-            rodata.big_core_phys_mask[0] = topo.big_core_phys_mask;
-            rodata.big_core_smt_mask[0] = topo.big_core_smt_mask;
-            rodata.little_core_mask[0] = topo.little_core_mask;
-            rodata.vcache_llc_mask[0] = topo.vcache_llc_mask;
-            rodata.has_vcache = topo.has_vcache;
-            rodata.has_hybrid_cores = topo.big_core_phys_mask != 0;
-
-            for i in 0..topo.cpu_sibling_map.len() {
-                rodata.cpu_sibling_map[i] = topo.cpu_sibling_map[i];
+            // Heterogeneous Gaming Topology — only compiled when CAKE_HAS_HYBRID
+            #[cfg(cake_has_hybrid)]
+            {
+                for i in 0..topo.big_core_phys_mask.len().min(rodata.big_core_phys_mask.len()) {
+                    rodata.big_core_phys_mask[i] = topo.big_core_phys_mask[i];
+                }
+                for i in 0..topo.big_core_smt_mask.len().min(rodata.big_core_smt_mask.len()) {
+                    rodata.big_core_smt_mask[i] = topo.big_core_smt_mask[i];
+                }
+                for i in 0..topo.little_core_mask.len().min(rodata.little_core_mask.len()) {
+                    rodata.little_core_mask[i] = topo.little_core_mask[i];
+                }
+                rodata.has_hybrid_cores = topo.big_core_phys_mask.iter().any(|&w| w != 0);
             }
-            for i in 0..topo.llc_cpu_mask.len().min(8) {
+            for i in 0..topo.vcache_llc_mask.len().min(rodata.vcache_llc_mask.len()) {
+                rodata.vcache_llc_mask[i] = topo.vcache_llc_mask[i];
+            }
+            rodata.has_vcache = topo.has_vcache;
+
+            for i in 0..topo.cpu_sibling_map.len().min(rodata.cpu_sibling_map.len()) {
+                rodata.cpu_sibling_map[i] = topo.cpu_sibling_map[i] as _;
+            }
+            for i in 0..topo.llc_cpu_mask.len().min(rodata.llc_cpu_mask.len()) {
                 rodata.llc_cpu_mask[i] = topo.llc_cpu_mask[i];
             }
-            for i in 0..topo.core_cpu_mask.len().min(32) {
+            for i in 0..topo.core_cpu_mask.len().min(rodata.core_cpu_mask.len()) {
                 rodata.core_cpu_mask[i] = topo.core_cpu_mask[i];
             }
 
@@ -318,12 +329,10 @@ impl<'a> Scheduler<'a> {
                 rodata.cpu_llc_id[i] = llc_id as u32;
             }
 
-            // Performance-ordered CPU arrays: read prefcore ranking from sysfs,
-            // sort by performance, group SMT pairs together.
-            // GAME tasks scan fast→slow, non-GAME scans slow→fast.
+            // Performance-ordered CPU scan arrays — HYBRID ONLY
+            #[cfg(cake_has_hybrid)]
             {
-                let nr = topo.nr_cpus.min(256);
-                // Read prefcore ranking per CPU (higher = faster)
+                let nr = topo.nr_cpus.min(topology::MAX_CPUS);
                 let mut rankings: Vec<(usize, u32)> = (0..nr)
                     .map(|cpu| {
                         let path = format!(
@@ -333,41 +342,38 @@ impl<'a> Scheduler<'a> {
                         let rank = std::fs::read_to_string(&path)
                             .ok()
                             .and_then(|s| s.trim().parse::<u32>().ok())
-                            .unwrap_or(100); // fallback: equal ranking
+                            .unwrap_or(100);
                         (cpu, rank)
                     })
                     .collect();
 
-                // Sort by descending rank (fastest first), stable for SMT grouping
                 rankings.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
-                // Build fast→slow array with SMT pairs grouped together:
-                // [best_phys, best_smt, second_phys, second_smt, ...]
-                let mut fast_to_slow: Vec<u8> = Vec::with_capacity(nr);
+                let mut fast_to_slow: Vec<u16> = Vec::with_capacity(nr);
                 let mut used = vec![false; nr];
                 for &(cpu, _) in &rankings {
                     if used[cpu] {
                         continue;
                     }
-                    fast_to_slow.push(cpu as u8);
+                    fast_to_slow.push(cpu as u16);
                     used[cpu] = true;
-                    // Add SMT sibling immediately after
-                    let sib = topo.cpu_sibling_map.get(cpu).copied().unwrap_or(0xFF);
+                    let sib = topo.cpu_sibling_map.get(cpu).copied().unwrap_or(0xFFFF);
                     if (sib as usize) < nr && !used[sib as usize] {
                         fast_to_slow.push(sib);
                         used[sib as usize] = true;
                     }
                 }
 
-                // Populate RODATA arrays
-                for i in 0..64usize {
+                for i in 0..topology::MAX_CPUS {
+                    if i >= rodata.cpus_fast_to_slow.len() {
+                        break;
+                    }
                     if i < fast_to_slow.len() {
-                        rodata.cpus_fast_to_slow[i] = fast_to_slow[i];
-                        // Reverse for slow→fast
-                        rodata.cpus_slow_to_fast[i] = fast_to_slow[fast_to_slow.len() - 1 - i];
+                        rodata.cpus_fast_to_slow[i] = fast_to_slow[i] as _;
+                        rodata.cpus_slow_to_fast[i] = fast_to_slow[fast_to_slow.len() - 1 - i] as _;
                     } else {
-                        rodata.cpus_fast_to_slow[i] = 0xFF; // sentinel
-                        rodata.cpus_slow_to_fast[i] = 0xFF;
+                        rodata.cpus_fast_to_slow[i] = rodata.cpus_fast_to_slow[i].wrapping_sub(1);
+                        rodata.cpus_slow_to_fast[i] = rodata.cpus_slow_to_fast[i].wrapping_sub(1);
                     }
                 }
 
@@ -384,7 +390,7 @@ impl<'a> Scheduler<'a> {
             // Intel hybrid: P-cores ~1024, E-cores ~600-700.
             // AMD SMP: all 1024 → cap > 0 && cap < 1024 is always false → zero overhead.
             {
-                let nr = topo.nr_cpus.min(256);
+                let nr = topo.nr_cpus.min(topology::MAX_CPUS);
                 let mut all_equal = true;
                 let mut first_cap: u32 = 0;
 
