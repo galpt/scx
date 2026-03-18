@@ -141,10 +141,11 @@ _Static_assert(CAKE_MAX_CPUS >= 16 && CAKE_MAX_CPUS <= 512,
  * At 16 CPUs: (16+63)/64 = 1 word.  At 64: 1.  At 512: 8. */
 #define CAKE_CPU_MASK_WORDS ((CAKE_MAX_CPUS + 63) / 64)
 
-/* Auto-size CPU ID type: u8 for ≤256 CPUs (consumer), u16 for >256 (EPYC).
+/* Auto-size CPU ID type: u8 for <256 CPUs (consumer), u16 for ≥256 (EPYC).
+ * Strict <256: CPU ID 255 must NOT collide with sentinel 0xFF.
  * Saves 1 byte per RODATA entry on consumer hardware vs always-u16.
  * Uses standard C types for bindgen compatibility. */
-#if CAKE_MAX_CPUS <= 256
+#if CAKE_MAX_CPUS < 256
 typedef unsigned char  cake_cpu_id_t;
 #define CAKE_CPU_SENTINEL 0xFF
 #else

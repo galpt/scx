@@ -1665,9 +1665,14 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
 					    slice, wake_flags);
 			return cpu;
 		}
-		/* !idle: fall through to Gate 2 (hybrid P/E scan) if available. */
+		/* !idle: on hybrid, jump to Gate 2 P/E scan.
+		 * On non-hybrid, skip select_cpu_and_idle (it's the 6.17+ path)
+		 * and fall through to the tunnel (return prev_cpu).
+		 * CO-RE prunes this entire block on 6.17+. */
 #ifdef CAKE_HAS_HYBRID
 		goto gate2;
+#else
+		goto tunnel;
 #endif
 	}
 
@@ -1745,6 +1750,7 @@ gate2:
 #ifdef CAKE_RELEASE
 	#undef stats_on
 #endif
+tunnel:
 	return prev_cpu;
 }
 /* Cut 3: enqueue_depth_scale_slice DELETED — zero callers after removal.

@@ -792,6 +792,15 @@ impl Drop for Scheduler<'_> {
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Route libbpf messages through log crate — trim trailing \n to avoid double-newlines.
+    libbpf_rs::set_print(Some((libbpf_rs::PrintLevel::Debug, |level, msg| {
+        let msg = msg.trim_end();
+        match level {
+            libbpf_rs::PrintLevel::Debug => log::debug!("{msg}"),
+            libbpf_rs::PrintLevel::Info  => log::info!("{msg}"),
+            libbpf_rs::PrintLevel::Warn  => log::warn!("{msg}"),
+        }
+    })));
 
     let args = Args::parse();
 
