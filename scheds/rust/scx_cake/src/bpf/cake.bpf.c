@@ -2233,16 +2233,11 @@ static __noinline void stopping_reclassify(
 	u32 packed,
 	u64 tick_slice)
 {
-	/* EEVDF NICE: always runs regardless of state.
-	 * Hoisted before the GAMING gate so non-GAMING tasks still get
-	 * correct vtime_mult updates (nice changes apply everywhere).
-	 * BPF division: ~20-40 cycles, but runs only 1/64 stops (Rule 40). */
-	{
-		u32 w = p->scx.weight ?: 100;
-		u16 mult = (u16)(102400 / w);
-		if (hot->vtime_mult != mult)
-			hot->vtime_mult = mult;
-	}
+	/* EEVDF NICE: vtime_mult computed in cake_set_weight (Idea 1).
+	 * Kernel calls cake_set_weight on nice/cgroup changes — division
+	 * runs once per weight change (~once per task lifetime) instead of
+	 * once per 64 stops. Eliminates the only division from the pipeline.
+	 * Seeded in cake_init_task with initial weight. */
 
 	/* !GAMING early exit: when sched_state != GAMING, game_tgid/ppid == 0
 	 * (Rust writes both atomically), so cls_game = false. All penalty
@@ -2302,7 +2297,10 @@ static __noinline void stopping_reclassify(
 	}
 
 	/* Rule 37: Fuse cls_squeeze + !is_kthread into cls_penalty.
-	 * GAMING already confirmed — snap_sched_state check removed. */
+	 * GAMING already confirmed — snap_sched_state check removed.
+	 * NOTE: WB check is technically dead (caller clears WB from packed),
+	 * but removing it causes Clang to restructure the branch topology
+	 * and produce +14 insns. Keep it as a compiler optimization hint. */
 	bool cls_penalty = !cls_game
 		&& !(((packed >> SHIFT_FLAGS) & CAKE_FLOW_WAKER_BOOST))
 		&& !is_kthread;
@@ -2350,13 +2348,12 @@ static __noinline u32 stopping_drr_ewma(
 	 * Compute EWMA BEFORE rt_raw so p does not need to survive
 	 * across the EWMA block. This shrinks p liveness from ~38
 	 * instructions to ~5, eliminating 2 spills (Rule 73). */
-	u32 rc = hot->reclass_counter++;
+	/* Variant B: pre-increment + reordered loads.
+	 * Increment counter first, then compute EWMA.
+	 * Reorder: interval computed before wc load so Clang
+	 * can interleave BSS loads (run_start) with hot loads (wc). */
+	u32 rc = ++hot->reclass_counter;
 
-	/* FunSearch DRR V8: EWMA FIRST, reclassify AFTER.
-	 * EWMA has no dependency on reclassify output.
-	 * Reclassify call at function END means hot doesn't need to
-	 * survive past it — saves r6 callee-save reservation.
-	 * Rule 13: reclassify is cold (1/64), EWMA is hot (100%). */
 	{
 		u32 rs = bss->run_start;
 		u32 interval = rs - hot->last_run_at;
@@ -2408,8 +2405,8 @@ static __noinline u32 stopping_drr_ewma(
  * Writes: hot->dsq_vtime. */
 static __noinline u32 stopping_eevdf_weight(
 	struct cake_task_hot *hot,
-	u32 rt_raw,
 	u32 cpu_run,
+	u32 rt_raw,
 	u64 vtime_local)
 {
 	u8 tc = hot->task_class;
@@ -2483,15 +2480,16 @@ static __noinline void stopping_quantum_pack(
 	 * full dispatch → local DSQ + LLC DSQ checked → fair scheduling.
 	 * GAME double-slice moved to enqueue_wakeup_path. */
 
-	/* P2C: home_cpu (STAGED_SHIFT_HOME) and wb_dup (STAGED_BIT_WB_DUP) pruned —
-	 * Rule 5/74: both have zero BPF read sites. Only dsq_weight, new_flow,
-	 * and VALID are consumed by enqueue paths. packed_info load eliminated. */
-	{
-		u64 nf_val = (tc == CAKE_CLASS_GAME) ? 1 : (u64)((hot->packed_info >> SHIFT_FLAGS) & 1);
+	/* P2C: staged bits pruned to 3 live fields (VALID, NEW_FLOW, DSQ_WEIGHT).
+	 * Rule 5/74: HOME_CPU, BG_NOISE, WAKER_BOOST, GAME_MEMBER, HOG, WB_DUP
+	 * all had zero BPF read sites. packed_info load eliminated. */
+		/* Variant D: unconditional new_flow read.
+		 * GAME tasks have new_flow=1 (set in cake_init_task, never cleared
+		 * for GAME class). Non-GAME tasks read their actual value.
+		 * Eliminates the tc == CAKE_CLASS_GAME ternary branch entirely. */
 		hot->staged_vtime_bits = (1ULL << STAGED_BIT_VALID) |
-					(nf_val << STAGED_BIT_NEW_FLOW) |
+					((u64)hot->new_flow << STAGED_BIT_NEW_FLOW) |
 					(u64)dsq_weight;
-	}
 }
 
 /* cake_stopping — direct arena access + confidence-gated PELT
@@ -2559,7 +2557,7 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
 	 * Extracted to __noinline — handles sleep_lag, warm_cpus, vtime,
 	 * DSQ weight, rt_cost, nice scaling, lag credit.
 	 * Returns 0 if non-runnable (skip quantum/pack), dsq_weight otherwise. */
-	u32 dsq_weight = stopping_eevdf_weight(hot, rt_raw, cpu_run,
+	u32 dsq_weight = stopping_eevdf_weight(hot, cpu_run, rt_raw,
 		cpu_bss[cpu_run & 0xFF].vtime_local);
 
 	/* Gate Phase C on dsq_weight instead of runnable.
@@ -2787,7 +2785,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init_task, struct task_struct *p,
 	 * build_cached_cpumask + bpf_rcu_read_lock/unlock eliminated (Rule 64). */
 
 	/* Phase 6: Allocate task_storage and mirror CL0 hot fields.
-	 * BPF_LOCAL_STORAGE_GET_F_CREATE allocates on first call. */
+	 * BPF_LOCAL_STORAGE_GET_F_CREATE allocates on first call.
+	 * dsq_vtime NOT seeded here — cake_enable always overwrites it
+	 * with the correct vtime_local before the task is schedulable.
+	 * Eliminates bpf_get_smp_processor_id() kfunc + BSS indexing. */
 	struct cake_task_hot *hot = bpf_task_storage_get(
 		&task_hot_stor, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (hot) {
@@ -2806,9 +2807,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init_task, struct task_struct *p,
 		*(u64 *)&hot->warm_cpus[0] = 0xFFFFFFFFFFFFFFFFULL;
 		hot->nvcsw_snapshot    = p->nvcsw;
 		hot->task_class        = CAKE_CLASS_NORMAL;
-		hot->vtime_mult        = 1024;  /* nice0 baseline (102400/100) */
-
-		hot->dsq_vtime         = cpu_bss[bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1)].vtime_local;
+		hot->new_flow          = 1;  /* Idea 5: standalone new-flow flag */
+		/* vtime_mult: seeded by cake_set_weight (kernel calls it immediately
+		 * after init_task with p->scx.weight). Division removed from here —
+		 * eliminates 20-40 cycle IDIV + 5 supporting insns from init path.
+		 * Default 1024 = nice-0 (102400/100). Safe: set_weight always fires. */
+		hot->vtime_mult = 1024;
+		/* dsq_vtime: seeded by cake_enable (always called after init_task).
+		 * Removed from here to eliminate bpf_get_smp_processor_id() kfunc
+		 * + BSS indexing chain (~8 insns). */
 	}
 
 	return 0;
@@ -2819,6 +2826,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init_task, struct task_struct *p,
  * For cake, we store in arena (avoids kernel dsq_insert_vtime overwrite). */
 void BPF_STRUCT_OPS(cake_enable, struct task_struct *p)
 {
+	/* Approach 3: get_task_hot FIRST, then CPU call.
+	 * p → r6 (callee-save) across storage call.
+	 * hot → r7 (callee-save) across CPU call.
+	 * Each kfunc has only 1 value to preserve → 0 spills. */
 	struct cake_task_hot *hot = get_task_hot(p);
 	if (hot)
 		hot->dsq_vtime = cpu_bss[bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1)].vtime_local;
@@ -3155,8 +3166,17 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
  * callback signals to the framework that cake is weight-aware. */
 void BPF_STRUCT_OPS(cake_set_weight, struct task_struct *p, u32 weight)
 {
-	/* Weight already stored in p->scx.weight by kernel.
-	 * F4 reads it in cake_stopping. Nothing to do here. */
+	/* Idea 1: compute vtime_mult here instead of every 64th stop.
+	 * The kernel calls this when p->scx.weight changes (nice/cgroup).
+	 * Division runs ~once per task lifetime vs. 1/64 stops.
+	 * Eliminates the only division from the scheduling pipeline. */
+	struct cake_task_hot *hot = get_task_hot(p);
+	if (hot) {
+		u32 w = weight ?: 100;
+		u16 mult = (u16)(102400 / w);
+		if (hot->vtime_mult != mult)
+			hot->vtime_mult = mult;
+	}
 }
 
 SCX_OPS_DEFINE(cake_ops, .select_cpu = (void *)cake_select_cpu,

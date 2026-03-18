@@ -211,7 +211,7 @@ flowchart TD
 
 - **`cake_task_hot`** (BPF task_storage, ~10ns lookup) — CL0 scheduling-critical fields used every stop: `task_class`, `deficit_u16`, `packed_info`, `warm_cpus`, `staged_vtime_bits`, `nice_shift`, `sleep_lag`, `cached_cpumask`
 - **`cake_task_ctx`** (BPF Arena, ~29ns TLB walk) — Telemetry-only fields, gated behind `CAKE_STATS_ACTIVE`. Dead in release builds.
-- **`cake_cpu_bss`** (BSS array, L1-cached) — Per-CPU hot fields: `run_start`, `tick_slice`, `is_yielder`, `cached_now`, `idle_hint`, `waker_boost`, `cached_perf`
+- **`cake_cpu_bss`** (BSS array, L1-cached) — Per-CPU hot fields: `run_start`, `tick_slice`, `is_yielder`, `idle_hint`, `vtime_local`, `sched_state_local`
 
 **Per-CPU arena** (`cake_per_cpu`, conditional sizing):
 
@@ -246,7 +246,7 @@ flowchart LR
 
 ### Kfunc Tunneling
 
-`select_cpu` caches `scx_bpf_now()` in per-CPU BSS (`cpu_bss[cpu].cached_now`). `enqueue` reuses this value, saving ~15ns (1 kfunc trampoline entry) on the all-busy path.
+`select_cpu` caches key decisions in per-CPU BSS (`cpu_bss`). Previously included `cached_now` for timestamp tunneling, which was pruned after analysis showed zero read sites (Rule 74). Current tunneling uses `vtime_local` and `last_pid` for same-task fast paths.
 
 ### VPROT: Preemption Protection
 

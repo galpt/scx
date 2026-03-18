@@ -63,7 +63,10 @@ struct cake_task_hot {
 	u16 waker_cpu;         /* 2B: CPU where waker last ran */
 	u64 nvcsw_snapshot;    /* 8B: Last nvcsw for yield detection */
 	u8  task_class;        /* 1B: CAKE_CLASS_* enum */
-	u8  _pad_hot;          /* 1B: alignment */
+	u8  new_flow;          /* 1B: new-flow flag (CAKE_FLOW_NEW) — standalone byte
+				 *     replaces 4-insn extraction from packed_info.
+				 *     Set to 1 in cake_init_task, read in stopping_quantum_pack.
+				 *     Was _pad_hot alignment byte. */
 	u16 vtime_mult;        /* 2B: EEVDF vtime reciprocal (102400/weight, 1024=nice0) */
 	/* cached_cpumask REMOVED: after scx_bpf_select_cpu_and refactor,
 	 * kernel handles affinity via p->cpus_ptr natively. 0 read sites. */
@@ -101,8 +104,8 @@ struct cake_cpu_bss {
 				 *     Eliminates remote global BSS cache line
 				 *     fetch at 5 hot-path sites. */
 	u8  _reserved[3];       /* 3B  off 29: available for future use */
-	u64 cached_now;         /* 8B  off 32: scx_bpf_now() from select_cpu tunnel */
-	u8  _pad[88];           /* 88B off 40: pad to 128B (V-Cache sector) */
+	u8  _pad[96];           /* 96B off 32: pad to 128B (V-Cache sector).
+				 *     cached_now REMOVED: zero readers (Rule 74). */
 } __attribute__((aligned(128)));
 /* 128B alignment (Rule 15): 9800X3D V-Cache uses 128B sectors.
  * At 64B, adjacent CPUs shared one sector — writes to CPU N's vtime_local
@@ -170,23 +173,16 @@ typedef unsigned short cake_cpu_id_t;
 #define LLC_DSQ_BASE 200
 
 /* ── dsq_vtime STAGED BIT LAYOUT (Rule 54: no magic positions) ──
- * Written by cake_stopping, read by cake_running + cake_select_cpu.
+ * Written by cake_stopping (stopping_quantum_pack),
+ * read by cake_running + cake_enqueue.
  *   [63]       = VALID (set once context exists)
- *   [62:55]    = HOME_CPU (warm_cpus[1] & 0xFF, prev home)
- *   [53]       = BG_NOISE (non-game, non-wb, non-kernel squeeze)
- *   [52]       = WAKER_BOOST (propagated via waker chain)
- *   [51]       = GAME_MEMBER (tgid match)
- *   [50]       = HOG (BULK tier + non-boosted)
- *   [49]       = WAKER_BOOST_DUP (Gate 1P — was VCSW yielder)
  *   [48]       = NEW_FLOW (first enqueue after init)
- *   [31:0]     = DSQ_WEIGHT (dsq_weight: tier_base + pelt_scaled, or inverted PELT for GAME during GAMING) */
+ *   [31:0]     = DSQ_WEIGHT (tier_base + pelt_scaled, or inverted PELT for GAME)
+ *
+ * Bits [62:49] are RESERVED — available for future use.
+ * Previously allocated: HOME_CPU, BG_NOISE, WAKER_BOOST, GAME_MEMBER,
+ * HOG, WB_DUP — all pruned (zero writers/readers, Rule 74). */
 #define STAGED_BIT_VALID        63
-#define STAGED_SHIFT_HOME       55
-#define STAGED_BIT_BG_NOISE     53  /* Background noise squeeze */
-#define STAGED_BIT_WAKER_BOOST  52
-#define STAGED_BIT_GAME_MEMBER  51
-#define STAGED_BIT_HOG          50
-#define STAGED_BIT_WB_DUP       49  /* Gate 1P: waker_boost duplicate */
 #define STAGED_BIT_NEW_FLOW     48
 
 /* ── Kfunc BenchLab: extensible per-kfunc stopwatch ──
@@ -736,7 +732,7 @@ struct cake_stats {
  *           at 125 MIG/s because the standard threshold blocked reclaiming its home
  *           CPU from hogs that ran <100µs. 50µs ensures the hog got a reasonable
  *           quantum while the VIP avoids the ~10-40ns L3 penalty of migration.
- *           Selected via STAGED_BIT_GAME_MEMBER (already in register, ~0ns). */
+ *           Selected via hot->task_class == CAKE_CLASS_GAME (~0ns, L1-cached). */
 #define CAKE_PREEMPT_YIELDER_THRESHOLD_NS (100 * 1000) /* 100µs — normal tasks */
 #define CAKE_PREEMPT_VIP_THRESHOLD_NS      (50 * 1000) /*  50µs — game family VIPs */
 
