@@ -2250,8 +2250,13 @@ static __noinline void stopping_reclassify(
 	 * sched_state is rarely written (MESI-S). Acceptable. */
 	u32 snap_sched_state = sched_state;
 	if (snap_sched_state != CAKE_STATE_GAMING) {
-		if (hot->task_class != CAKE_CLASS_NORMAL)
+		/* MESI guard: saves RODATA fetch on 95% of 1/64 calls.
+		 * Cache line is already Modified, but the guard avoids the
+		 * tier_base RODATA lookup (5 insns) when class is stable. */
+		if (hot->task_class != CAKE_CLASS_NORMAL) {
 			hot->task_class = CAKE_CLASS_NORMAL;
+			hot->dsq_weight_base = 8192; /* tier_base[NORMAL] */
+		}
 		return;
 	}
 
@@ -2316,9 +2321,14 @@ static __noinline void stopping_reclassify(
 		  : cls_hog        ? CAKE_CLASS_HOG
 		  : cls_bg         ? CAKE_CLASS_BG
 		  : CAKE_CLASS_NORMAL;
-	/* Rule 11: MESI check-before-write (~95% stable). */
-	if (hot->task_class != new_tc)
+	/* MESI guard: saves RODATA fetch on 95% of 1/64 calls.
+	 * Cache line is already Modified from EWMA writes, but guard
+	 * avoids tier_base RODATA lookup (5 insns) when class stable.
+	 * ~2.35 insns avg vs 7 insns unconditional = 3.7x cheaper. */
+	if (hot->task_class != new_tc) {
 		hot->task_class = new_tc;
+		hot->dsq_weight_base = tier_base[new_tc & 3];
+	}
 }
 /* ═══ Phase 7A-1: Compute rt_raw (pure compute, 0 internal calls → 0 spills) ═══
  *
@@ -2339,19 +2349,14 @@ static __noinline void stopping_reclassify(
 static __noinline u32 stopping_drr_ewma(
 	struct cake_task_hot *hot,
 	struct task_struct *p,
-	u32 cpu_run)
+	u32 cpu)
 {
-	u32 cpu = cpu_run & 0xFF;
 	struct cake_cpu_bss *bss = &cpu_bss[cpu];
 
 	/* ════ EWMA BLOCK (no p dependency) ════
 	 * Compute EWMA BEFORE rt_raw so p does not need to survive
 	 * across the EWMA block. This shrinks p liveness from ~38
 	 * instructions to ~5, eliminating 2 spills (Rule 73). */
-	/* Variant B: pre-increment + reordered loads.
-	 * Increment counter first, then compute EWMA.
-	 * Reorder: interval computed before wc load so Clang
-	 * can interleave BSS loads (run_start) with hot loads (wc). */
 	u32 rc = ++hot->reclass_counter;
 
 	{
@@ -2405,16 +2410,14 @@ static __noinline u32 stopping_drr_ewma(
  * Writes: hot->dsq_vtime. */
 static __noinline u32 stopping_eevdf_weight(
 	struct cake_task_hot *hot,
-	u32 cpu_run,
 	u32 rt_raw,
-	u64 vtime_local)
+	u64 vtime_local,
+	bool runnable)
 {
-	u8 tc = hot->task_class;
-
 	/* Non-runnable: no vtime advancement, return 0.
 	 * Rule 74: The vtime gap from NOT advancing IS the sleeper credit.
 	 * No side effects needed — intrinsic state. */
-	if (!(cpu_run >> 8))
+	if (!runnable)
 		return 0;
 
 	/* EEVDF vtime advancement — the core operation.
@@ -2436,16 +2439,9 @@ static __noinline u32 stopping_eevdf_weight(
 			hot->dsq_vtime = vt_min;
 	}
 
-	/* DSQ weight: fixed tier offset for class separation.
-	 * Vtime rate handles proportional ordering within tiers;
-	 * tier_base provides absolute priority gaps between classes.
-	 *
-	 * FunSearch V6: wake_bonus block REMOVED — provably dead code.
-	 * tier_base[CAKE_CLASS_GAME] == 0, so the branchless subtraction
-	 * dsq_weight -= wb & -(dsq_weight > wb) always yields:
-	 * 0 - (wb & -(0 > wb)) = 0 - (wb & 0) = 0.
-	 * Zero instructions wasted on a nop. */
-	return tier_base[tc & 3];
+	/* Theory 3: pre-cached dsq_weight_base eliminates 5-insn RODATA
+	 * indexed lookup. Written in cake_init_task and stopping_reclassify. */
+	return hot->dsq_weight_base;
 }
 
 /* ═══ Phase 7C: Quantum + Staged Pack (≤4 live values → 0 spills) ═══
@@ -2514,20 +2510,17 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
 	 * Then get_task_hot (p=r6, cpu_run=r7 survive = 2 callee-saves).
 	 * Neither call exceeds 4 callee-saves → 0 spills. */
 	u32 cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
-	/* FunSearch: explicit (runnable & 1) forces branchless packing.
-	 * BPF struct_ops extracts runnable as u64 — compiler doesn't trust
-	 * it to be 0/1 and generates a branch. The & 1 constrains the value,
-	 * enabling shift-OR instead of branch. Rule 14: bitwise ops. */
-	u32 cpu_run = cpu | (((u32)runnable & 1) << 8);
+	/* Idea D: cpu and runnable passed separately to helpers.
+	 * Eliminates 6-insn packing (zero+branch+set+mask+copy+OR)
+	 * and 2-insn unpacking (& 0xFF, >> 8) from hot path. */
 
 	struct cake_task_hot *hot = get_task_hot(p);
 	if (unlikely(!hot))
 		return;
 
 	/* ═══ Phase 7A: DRR + Classify + EWMA + rt_raw (fused) ═══
-	 * stopping_get_rt_raw merged into stopping_drr_ewma.
-	 * BSS indexing shared, rt_raw returned. Rule 24: operation fusion. */
-	u32 rt_raw = stopping_drr_ewma(hot, p, cpu_run);
+	 * Idea D: cpu passed directly (no cpu_run packing/unpacking). */
+	u32 rt_raw = stopping_drr_ewma(hot, p, cpu);
 	u8 tc = hot->task_class;
 
 	bool stats_on = CAKE_STATS_ACTIVE;
@@ -2557,8 +2550,8 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
 	 * Extracted to __noinline — handles sleep_lag, warm_cpus, vtime,
 	 * DSQ weight, rt_cost, nice scaling, lag credit.
 	 * Returns 0 if non-runnable (skip quantum/pack), dsq_weight otherwise. */
-	u32 dsq_weight = stopping_eevdf_weight(hot, cpu_run, rt_raw,
-		cpu_bss[cpu_run & 0xFF].vtime_local);
+	u32 dsq_weight = stopping_eevdf_weight(hot, rt_raw,
+		cpu_bss[cpu].vtime_local, runnable);
 
 	/* Gate Phase C on dsq_weight instead of runnable.
 	 * stopping_eevdf_weight returns 0 for non-runnable tasks,
@@ -2655,7 +2648,7 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
 				u64 rem = p->scx.slice;
 				if (rem == 0)
 					tctx->telemetry.quantum_full_count++;
-				else if (!(cpu_run >> 8))
+				else if (!runnable)
 					tctx->telemetry.quantum_yield_count++;
 				else
 					tctx->telemetry.quantum_preempt_count++;
@@ -2813,6 +2806,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init_task, struct task_struct *p,
 		 * eliminates 20-40 cycle IDIV + 5 supporting insns from init path.
 		 * Default 1024 = nice-0 (102400/100). Safe: set_weight always fires. */
 		hot->vtime_mult = 1024;
+		/* Theory 3: seed dsq_weight_base = tier_base[NORMAL] = 8192. */
+		hot->dsq_weight_base = 8192;
 		/* dsq_vtime: seeded by cake_enable (always called after init_task).
 		 * Removed from here to eliminate bpf_get_smp_processor_id() kfunc
 		 * + BSS indexing chain (~8 insns). */

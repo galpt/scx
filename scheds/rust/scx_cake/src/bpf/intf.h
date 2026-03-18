@@ -68,8 +68,10 @@ struct cake_task_hot {
 				 *     Set to 1 in cake_init_task, read in stopping_quantum_pack.
 				 *     Was _pad_hot alignment byte. */
 	u16 vtime_mult;        /* 2B: EEVDF vtime reciprocal (102400/weight, 1024=nice0) */
-	/* cached_cpumask REMOVED: after scx_bpf_select_cpu_and refactor,
-	 * kernel handles affinity via p->cpus_ptr natively. 0 read sites. */
+	/* Theory 3: pre-cached tier_base[task_class] — eliminates 5-insn
+	 * RODATA indexed lookup from every runnable stop. Written in
+	 * cake_init_task and stopping_reclassify on class change. */
+	u32 dsq_weight_base;   /* 4B: tier_base[task_class] (was padding) */
 	u64 dsq_vtime;         /* 8B: G1+G4: EEVDF intra-tier vruntime (arena, no kernel overwrite) */
 }; /* Total: 64B (1 cache line) */
 
