@@ -161,6 +161,11 @@ static __always_inline bool is_pinned_kthread(const struct task_struct *p)
 	return is_kthread(p) && p->nr_cpus_allowed == 1;
 }
 
+static __always_inline bool is_non_migratable(const struct task_struct *p)
+{
+	return p->nr_cpus_allowed == 1 || is_migration_disabled(p);
+}
+
 static __always_inline s64 clamp_budget(s64 budget_ns)
 {
 	if (budget_ns > (s64)FLOW_BUDGET_MAX_NS)
@@ -801,6 +806,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(flow_init)
 {
 	s32 ret;
 
+	ret = scx_lib_init();
+	if (ret)
+		return ret;
+
 	ret = scx_bpf_create_dsq(LATENCY_DSQ, -1);
 	if (ret < 0 && ret != -EEXIST) {
 		scx_bpf_error("failed to create latency DSQ %d: %d", LATENCY_DSQ, ret);
@@ -873,6 +882,7 @@ s32 BPF_STRUCT_OPS(flow_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wak
 	s32 cpu;
 	s32 preferred_cpu;
 	s32 this_cpu = bpf_get_smp_processor_id();
+	bool non_migratable = is_non_migratable(p);
 	bool is_this_cpu_allowed = bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr);
 
 	tctx = lookup_task_ctx(p);
@@ -885,13 +895,19 @@ s32 BPF_STRUCT_OPS(flow_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wak
 		prev_cpu = is_this_cpu_allowed ? this_cpu : bpf_cpumask_first(p->cpus_ptr);
 
 	preferred_cpu = prev_cpu;
-	if (tctx && tctx->last_cpu >= 0 &&
+	if (!non_migratable && tctx && tctx->last_cpu >= 0 &&
 	    bpf_cpumask_test_cpu(tctx->last_cpu, p->cpus_ptr)) {
 		preferred_cpu = tctx->last_cpu;
 		__sync_fetch_and_add(&cpu_stability_biases, 1);
 	}
 
-	cpu = scx_bpf_select_cpu_dfl(p, preferred_cpu, wake_flags, &is_idle);
+	if (non_migratable) {
+		cpu = preferred_cpu;
+		is_idle = scx_bpf_test_and_clear_cpu_idle(preferred_cpu);
+	} else {
+		cpu = scx_bpf_select_cpu_dfl(p, preferred_cpu, wake_flags, &is_idle);
+	}
+
 	if (tctx) {
 		tctx->wake_cpu = cpu >= 0 ? cpu : preferred_cpu;
 		tctx->wake_cpu_idle = is_idle;
@@ -927,9 +943,11 @@ void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 	struct task_ctx *tctx;
 	struct flow_cpu_state *cstate;
 	s32 target_cpu = -1;
+	s32 task_cpu;
 	u64 slice_ns;
 	bool is_wakeup;
 	bool has_wake_target = false;
+	bool non_migratable = is_non_migratable(p);
 	bool rt_sensitive_wakeup = false;
 	bool soft_latency_wakeup = false;
 	bool debt_latency_wakeup = false;
@@ -950,6 +968,20 @@ void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 		has_wake_target = true;
 	} else {
 		target_cpu = scx_bpf_task_cpu(p);
+	}
+
+	task_cpu = scx_bpf_task_cpu(p);
+	if (non_migratable && task_cpu >= 0 &&
+	    bpf_cpumask_test_cpu(task_cpu, p->cpus_ptr)) {
+		if (!has_wake_target || target_cpu != task_cpu) {
+			target_cpu = task_cpu;
+			has_wake_target = true;
+			if (tctx) {
+				tctx->wake_cpu = task_cpu;
+				tctx->wake_cpu_idle = false;
+				tctx->wake_cpu_valid = true;
+			}
+		}
 	}
 
 	if (is_pinned_kthread(p)) {
