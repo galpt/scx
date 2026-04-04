@@ -384,9 +384,9 @@ impl AutoTuner {
         let wake_preempt = delta.wake_preempt_dispatches;
         let exhaustions = delta.budget_exhaustions;
         let runnable = delta.runnable_wakeups;
-        let stable_candidates = delta.stable_local_candidates;
-        let stable_rejections = delta.stable_local_rejections;
-        let stable_mismatches = delta.stable_local_mismatches;
+        let direct_candidates = delta.direct_local_candidates;
+        let direct_rejections = delta.direct_local_rejections;
+        let direct_mismatches = delta.direct_local_mismatches;
         let cpu_biases = delta.cpu_stability_biases;
         let reserved_total = reserved_local + reserved_global;
         let lane_events = positive + shared_wake + contained_enqueues;
@@ -406,8 +406,8 @@ impl AutoTuner {
         let preempt_ratio = wake_preempt as f64 / reserved_local.max(1) as f64;
         let exhaustion_ratio = exhaustions as f64 / positive.max(1) as f64;
         let contained_ratio = contained_enqueues as f64 / positive.max(1) as f64;
-        let stable_reject_ratio = stable_rejections as f64 / stable_candidates.max(1) as f64;
-        let stable_mismatch_ratio = stable_mismatches as f64 / cpu_biases.max(1) as f64;
+        let direct_reject_ratio = direct_rejections as f64 / direct_candidates.max(1) as f64;
+        let direct_mismatch_ratio = direct_mismatches as f64 / cpu_biases.max(1) as f64;
         let rescue_total = contained_rescues + shared_rescues;
         let rescue_ratio = rescue_total as f64 / dispatch_total.max(1) as f64;
         let latency_dispatch_ratio = total_latency_dispatches as f64 / dispatch_total.max(1) as f64;
@@ -430,9 +430,9 @@ impl AutoTuner {
             && ((shared_ratio < 0.45
                 && global_ratio < 0.30
                 && ((contained_dispatches > 0 && contained_ratio > 0.12)
-                    || (stable_candidates > 0
-                        && stable_reject_ratio > 0.20
-                        && stable_mismatch_ratio > 0.20)))
+                    || (direct_candidates > 0
+                        && direct_reject_ratio > 0.20
+                        && direct_mismatch_ratio > 0.20)))
                 || (reserved_local >= 2
                     && preempt_ratio > 0.65
                     && shared_ratio < 0.35
@@ -658,10 +658,10 @@ impl<'a> Scheduler<'a> {
             reserved_lane_contained_misses: bss_data.reserved_lane_contained_misses,
             contained_starved_head_enqueues: bss_data.contained_starved_head_enqueues,
             shared_starved_head_enqueues: bss_data.shared_starved_head_enqueues,
-            stable_local_candidates: bss_data.stable_local_candidates,
-            stable_local_enqueues: bss_data.stable_local_enqueues,
-            stable_local_rejections: bss_data.stable_local_rejections,
-            stable_local_mismatches: bss_data.stable_local_mismatches,
+            direct_local_candidates: bss_data.direct_local_candidates,
+            direct_local_enqueues: bss_data.direct_local_enqueues,
+            direct_local_rejections: bss_data.direct_local_rejections,
+            direct_local_mismatches: bss_data.direct_local_mismatches,
             contained_enqueues: bss_data.contained_enqueues,
             hog_containment_enqueues: bss_data.hog_containment_enqueues,
             hog_recoveries: bss_data.hog_recoveries,

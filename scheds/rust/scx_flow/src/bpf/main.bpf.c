@@ -25,7 +25,7 @@ struct task_ctx {
 	u32 latency_credit;
 	u32 latency_debt;
 	u32 hog_score;
-	u32 stable_score;
+	u32 direct_local_score;
 	s32 last_cpu;
 	s32 wake_cpu;
 	bool wake_cpu_idle;
@@ -98,10 +98,10 @@ volatile u64 reserved_lane_shared_misses;
 volatile u64 reserved_lane_contained_misses;
 volatile u64 contained_starved_head_enqueues;
 volatile u64 shared_starved_head_enqueues;
-volatile u64 stable_local_candidates;
-volatile u64 stable_local_enqueues;
-volatile u64 stable_local_rejections;
-volatile u64 stable_local_mismatches;
+volatile u64 direct_local_candidates;
+volatile u64 direct_local_enqueues;
+volatile u64 direct_local_rejections;
+volatile u64 direct_local_mismatches;
 volatile u64 contained_enqueues;
 volatile u64 hog_containment_enqueues;
 volatile u64 hog_recoveries;
@@ -233,7 +233,7 @@ static __always_inline void reset_task_ctx(struct task_ctx *tctx, u64 now, bool 
 	tctx->latency_credit = 0;
 	tctx->latency_debt = 0;
 	tctx->hog_score = 0;
-	tctx->stable_score = 0;
+	tctx->direct_local_score = 0;
 	tctx->last_cpu = -1;
 	clear_wake_target(tctx);
 }
@@ -439,30 +439,31 @@ static __always_inline bool decay_latency_debt(struct task_ctx *tctx, u32 delta)
 	return tctx->latency_debt != old_debt;
 }
 
-static __always_inline u32 clamp_stable_score(u32 stable_score)
+static __always_inline u32 clamp_direct_local_score(u32 direct_local_score)
 {
-	if (stable_score > FLOW_STABLE_SCORE_MAX)
-		return FLOW_STABLE_SCORE_MAX;
-	return stable_score;
+	if (direct_local_score > FLOW_DIRECT_LOCAL_SCORE_MAX)
+		return FLOW_DIRECT_LOCAL_SCORE_MAX;
+	return direct_local_score;
 }
 
-static __always_inline void raise_stable_score(struct task_ctx *tctx, u32 delta)
+static __always_inline void raise_direct_local_score(struct task_ctx *tctx, u32 delta)
 {
 	if (!tctx || !delta)
 		return;
 
-	tctx->stable_score = clamp_stable_score(tctx->stable_score + delta);
+	tctx->direct_local_score =
+		clamp_direct_local_score(tctx->direct_local_score + delta);
 }
 
-static __always_inline void decay_stable_score(struct task_ctx *tctx, u32 delta)
+static __always_inline void decay_direct_local_score(struct task_ctx *tctx, u32 delta)
 {
 	if (!tctx || !delta)
 		return;
 
-	if (tctx->stable_score <= delta)
-		tctx->stable_score = 0;
+	if (tctx->direct_local_score <= delta)
+		tctx->direct_local_score = 0;
 	else
-		tctx->stable_score -= delta;
+		tctx->direct_local_score -= delta;
 }
 
 static __always_inline void decay_hog_score(struct task_ctx *tctx, u32 delta)
@@ -553,8 +554,9 @@ static __always_inline bool is_soft_latency_candidate(const struct task_ctx *tct
 	return tctx->budget_ns >= (s64)FLOW_LATENCY_LANE_BUDGET_MIN_NS;
 }
 
-static __always_inline bool is_stable_local_candidate(const struct task_ctx *tctx,
+static __always_inline bool is_direct_local_candidate(const struct task_ctx *tctx,
 						      s32 target_cpu,
+						      bool wake_cpu_idle,
 						      bool is_wakeup,
 						      bool rt_sensitive_wakeup,
 						      bool latency_lane_wakeup,
@@ -566,13 +568,18 @@ static __always_inline bool is_stable_local_candidate(const struct task_ctx *tct
 		return false;
 	if (tctx->budget_ns <= 0)
 		return false;
-	if (tctx->last_cpu < 0 || target_cpu < 0 || target_cpu != tctx->last_cpu)
+	if (target_cpu < 0)
+		return false;
+	if (tctx->direct_local_score < FLOW_DIRECT_LOCAL_SCORE_MIN)
 		return false;
 
-	return tctx->stable_score >= FLOW_STABLE_LOCAL_SCORE_MIN;
+	if (tctx->last_cpu >= 0 && target_cpu == tctx->last_cpu)
+		return true;
+
+	return wake_cpu_idle;
 }
 
-static __always_inline bool allow_idle_local_fast_path(void)
+static __always_inline bool allow_direct_local_fast_path(void)
 {
 	u64 max_running = tune_local_fast_nr_running_max;
 
@@ -586,11 +593,13 @@ static __always_inline bool allow_idle_local_fast_path(void)
 	return true;
 }
 
-static __always_inline bool allow_stable_local_fast_path(void)
+static __always_inline u64 direct_local_slice_ns(u64 slice_ns)
 {
-	if (nr_running > FLOW_STABLE_LOCAL_NR_RUNNING_MAX)
-		return false;
-	return true;
+	if (slice_ns < FLOW_SLICE_MIN_NS)
+		return FLOW_SLICE_MIN_NS;
+	if (slice_ns > FLOW_DIRECT_LOCAL_SLICE_NS)
+		return FLOW_DIRECT_LOCAL_SLICE_NS;
+	return slice_ns;
 }
 
 static __always_inline void bump_starvation_round(u64 *counter, u64 max_rounds)
@@ -749,22 +758,22 @@ static __always_inline bool local_reserved_quota_active(struct flow_cpu_state *c
 		(cstate && cstate->shared_starvation_rounds > 0);
 }
 
-static __always_inline void note_stable_mismatch(struct task_ctx *tctx)
+static __always_inline void note_direct_local_mismatch(struct task_ctx *tctx)
 {
 	if (!tctx)
 		return;
 
-	__sync_fetch_and_add(&stable_local_mismatches, 1);
-	decay_stable_score(tctx, FLOW_STABLE_MISMATCH_DECAY);
+	__sync_fetch_and_add(&direct_local_mismatches, 1);
+	decay_direct_local_score(tctx, FLOW_DIRECT_LOCAL_MISMATCH_DECAY);
 }
 
-static __always_inline void note_stable_rejection(struct task_ctx *tctx)
+static __always_inline void note_direct_local_rejection(struct task_ctx *tctx)
 {
 	if (!tctx)
 		return;
 
-	__sync_fetch_and_add(&stable_local_rejections, 1);
-	decay_stable_score(tctx, FLOW_STABLE_MISMATCH_DECAY);
+	__sync_fetch_and_add(&direct_local_rejections, 1);
+	decay_direct_local_score(tctx, FLOW_DIRECT_LOCAL_MISMATCH_DECAY);
 }
 
 static __always_inline bool should_promote_shared_enqueue(struct flow_cpu_state *cstate)
@@ -917,7 +926,7 @@ s32 BPF_STRUCT_OPS(flow_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wak
 		if (tctx->last_cpu >= 0 && tctx->wake_cpu == tctx->last_cpu)
 			__sync_fetch_and_add(&last_cpu_matches, 1);
 		else if (tctx->last_cpu >= 0)
-			note_stable_mismatch(tctx);
+			note_direct_local_mismatch(tctx);
 	}
 
 	return cpu >= 0 ? cpu : preferred_cpu;
@@ -953,7 +962,7 @@ void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 	bool debt_latency_wakeup = false;
 	bool latency_lane_wakeup = false;
 	bool urgent_latency_wakeup = false;
-	bool stable_local_wakeup = false;
+	bool direct_local_wakeup = false;
 	bool contained_hog = false;
 	bool use_local_reserved = false;
 	bool ordinary_local_reserved = false;
@@ -1015,17 +1024,18 @@ void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 				!rt_sensitive_wakeup;
 			urgent_latency_wakeup = debt_latency_wakeup &&
 				!rt_sensitive_wakeup;
-			stable_local_wakeup = is_stable_local_candidate(tctx, target_cpu,
-									       is_wakeup,
-									       rt_sensitive_wakeup,
-									       latency_lane_wakeup,
-									       contained_hog);
-			if (stable_local_wakeup && !allow_stable_local_fast_path()) {
-				stable_local_wakeup = false;
-				note_stable_rejection(tctx);
+			direct_local_wakeup = is_direct_local_candidate(tctx, target_cpu,
+									tctx->wake_cpu_idle,
+									is_wakeup,
+									rt_sensitive_wakeup,
+									latency_lane_wakeup,
+									contained_hog);
+			if (direct_local_wakeup && !allow_direct_local_fast_path()) {
+				direct_local_wakeup = false;
+				note_direct_local_rejection(tctx);
 			}
-			if (stable_local_wakeup)
-				__sync_fetch_and_add(&stable_local_candidates, 1);
+			if (direct_local_wakeup)
+				__sync_fetch_and_add(&direct_local_candidates, 1);
 
 			if (is_wakeup && !contained_hog)
 				enq_flags |= SCX_ENQ_HEAD;
@@ -1056,11 +1066,7 @@ void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 					   tctx->budget_ns >= (s64)preempt_budget_min_ns)));
 
 				use_local_reserved = should_preempt ||
-					(!latency_lane_wakeup &&
-					 !contained_hog &&
-					 tctx->wake_cpu_idle && is_wakeup &&
-					 allow_idle_local_fast_path()) ||
-					stable_local_wakeup;
+					direct_local_wakeup;
 				ordinary_local_reserved = use_local_reserved &&
 					!should_preempt;
 
@@ -1087,7 +1093,8 @@ void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 
 				if (use_local_reserved) {
 					u64 local_slice_ns = rt_sensitive_wakeup ?
-						FLOW_RT_WAKE_SLICE_NS : slice_ns;
+						FLOW_RT_WAKE_SLICE_NS :
+						direct_local_slice_ns(slice_ns);
 
 					if (urgent_latency_wakeup)
 						__sync_fetch_and_add(&urgent_latency_misses, 1);
@@ -1098,8 +1105,8 @@ void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 					__sync_fetch_and_add(&reserved_local_enqueues, 1);
 					if (rt_sensitive_wakeup)
 						__sync_fetch_and_add(&rt_sensitive_local_enqueues, 1);
-					if (stable_local_wakeup)
-						__sync_fetch_and_add(&stable_local_enqueues, 1);
+					if (direct_local_wakeup)
+						__sync_fetch_and_add(&direct_local_enqueues, 1);
 					if (tctx->wake_cpu_idle)
 						__sync_fetch_and_add(&local_fast_dispatches, 1);
 					if (ordinary_local_reserved)
@@ -1109,8 +1116,8 @@ void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 				}
 			}
 
-			if (stable_local_wakeup)
-				note_stable_rejection(tctx);
+			if (direct_local_wakeup)
+				note_direct_local_rejection(tctx);
 
 			if (contained_hog) {
 				if (should_promote_contained_enqueue(cstate)) {
@@ -1359,9 +1366,7 @@ void BPF_STRUCT_OPS(flow_running, struct task_struct *p)
 	if (tctx) {
 		if (tctx->last_cpu >= 0 && tctx->last_cpu != current_cpu) {
 			__sync_fetch_and_add(&cpu_migrations, 1);
-			decay_stable_score(tctx, FLOW_STABLE_SCORE_DECAY);
-		} else {
-			raise_stable_score(tctx, FLOW_STABLE_SCORE_GAIN);
+			decay_direct_local_score(tctx, FLOW_DIRECT_LOCAL_SCORE_DECAY);
 		}
 		tctx->last_cpu = current_cpu;
 		tctx->last_run_at = now;
@@ -1393,6 +1398,8 @@ void BPF_STRUCT_OPS(flow_stopping, struct task_struct *p, bool runnable)
 			raise_hog_score(tctx, FLOW_HOG_SCORE_EXHAUST_STEP);
 		if (exhausted_budget)
 			decay_latency_credit(tctx, tuned_latency_credit_decay());
+		if (exhausted_budget)
+			decay_direct_local_score(tctx, FLOW_DIRECT_LOCAL_SCORE_DECAY);
 		if (exhausted_budget && runnable &&
 		    !is_contained_hog(tctx) &&
 		    (tctx->last_refill_ns >= (s64)FLOW_LATENCY_LANE_REFILL_MIN_NS ||
@@ -1401,6 +1408,11 @@ void BPF_STRUCT_OPS(flow_stopping, struct task_struct *p, bool runnable)
 			__sync_fetch_and_add(&latency_debt_raises, 1);
 
 		tctx->budget_ns = clamp_budget(tctx->budget_ns - (s64)runtime_ns);
+		if (!runnable && !exhausted_budget &&
+		    !is_contained_hog(tctx) &&
+		    runtime_ns > 0 && runtime_ns <= FLOW_DIRECT_LOCAL_SLICE_NS &&
+		    tctx->last_cpu >= 0)
+			raise_direct_local_score(tctx, FLOW_DIRECT_LOCAL_SCORE_GAIN);
 		tctx->last_run_at = 0;
 		tctx->sleep_started_at = runnable ? 0 : now;
 		if (!runnable)

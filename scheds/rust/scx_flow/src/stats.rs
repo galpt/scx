@@ -132,14 +132,14 @@ pub struct Metrics {
     pub contained_starved_head_enqueues: u64,
     #[stat(desc = "Shared-lane enqueues promoted to the head because the shared lane was already meaningfully starved")]
     pub shared_starved_head_enqueues: u64,
-    #[stat(desc = "Stable-local wakeups that were eligible for last-CPU routing before final fast-path checks")]
-    pub stable_local_candidates: u64,
-    #[stat(desc = "Stable positive-budget wakeups routed directly to their last CPU without using the RT-sensitive path")]
-    pub stable_local_enqueues: u64,
-    #[stat(desc = "Stable-local candidates that lost the fast path and decayed back toward ordinary routing")]
-    pub stable_local_rejections: u64,
-    #[stat(desc = "Wakeups where the chosen target CPU did not match the remembered last CPU")]
-    pub stable_local_mismatches: u64,
+    #[stat(desc = "Direct-local wakeups that were eligible for the bounded front-door before final fast-path checks")]
+    pub direct_local_candidates: u64,
+    #[stat(desc = "Positive-budget wakeups routed through the bounded direct-local front-door without using the RT-sensitive path")]
+    pub direct_local_enqueues: u64,
+    #[stat(desc = "Direct-local candidates that lost the front-door and decayed back toward ordinary routing")]
+    pub direct_local_rejections: u64,
+    #[stat(desc = "Wakeups where the chosen target CPU did not match the remembered last CPU continuity hint")]
+    pub direct_local_mismatches: u64,
     #[stat(desc = "Tasks routed into the dedicated contained throughput/background DSQ")]
     pub contained_enqueues: u64,
     #[stat(desc = "Enqueues where a persistent hog-like task had latency privileges reduced")]
@@ -202,7 +202,7 @@ impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[{}] mode={} gen={} run={} urgent_lat_disp={} urgent_grant={} urgent_cont={} latency_disp={} reserve_disp={} contained_disp={} shared_disp={} local_fast={} wake_preempt={} refill={} exhaust={} pos_wake={} urgent_lat_enq={} latency_enq={} latency_cand={} latency_local={} latency_hog_block={} debt_raise={} debt_decay={} debt_urgent={} urgent_miss={} reserve_local={} reserve_global={} shared_wake={} runnable={} cpu_release={} urgent_burst={} high_prio_burst={} reserved_burst={} reserved_grant={} reserved_cont={} reserved_skip={} reserved_shared={} reserved_contained={} reserved_miss_shared={} reserved_miss_contained={} contained_head={} shared_head={} local_burst={} local_grant={} local_cont={} local_quota_skip={} quota_skip={} quota_shared={} quota_contained={} init_task={} enable={} exit_task={} cpu_bias={} last_cpu_hit={} migrations={} rt_wake={} rt_local={} rt_preempt={} stable_cand={} stable_local={} stable_reject={} stable_mismatch={} contained_enq={} hog_contain={} hog_recover={} contained_starve={} shared_starve={} contained_rescue={} shared_rescue={} reserve_cap_us={} shared_slice_us={} refill_floor_us={} preempt_budget_us={} preempt_refill_us={} credit_grant={} credit_decay={} debt_min={} urgent_burst_max={} reserved_quota_max={} reserved_lane_max={} contained_floor={} shared_floor={} local_fast_cap={} local_burst_max={}",
+            "[{}] mode={} gen={} run={} urgent_lat_disp={} urgent_grant={} urgent_cont={} latency_disp={} reserve_disp={} contained_disp={} shared_disp={} local_fast={} wake_preempt={} refill={} exhaust={} pos_wake={} urgent_lat_enq={} latency_enq={} latency_cand={} latency_local={} latency_hog_block={} debt_raise={} debt_decay={} debt_urgent={} urgent_miss={} reserve_local={} reserve_global={} shared_wake={} runnable={} cpu_release={} urgent_burst={} high_prio_burst={} reserved_burst={} reserved_grant={} reserved_cont={} reserved_skip={} reserved_shared={} reserved_contained={} reserved_miss_shared={} reserved_miss_contained={} contained_head={} shared_head={} local_burst={} local_grant={} local_cont={} local_quota_skip={} quota_skip={} quota_shared={} quota_contained={} init_task={} enable={} exit_task={} cpu_bias={} last_cpu_hit={} migrations={} rt_wake={} rt_local={} rt_preempt={} direct_cand={} direct_local={} direct_reject={} direct_mismatch={} contained_enq={} hog_contain={} hog_recover={} contained_starve={} shared_starve={} contained_rescue={} shared_rescue={} reserve_cap_us={} shared_slice_us={} refill_floor_us={} preempt_budget_us={} preempt_refill_us={} credit_grant={} credit_decay={} debt_min={} urgent_burst_max={} reserved_quota_max={} reserved_lane_max={} contained_floor={} shared_floor={} local_fast_cap={} local_burst_max={}",
             crate::SCHEDULER_NAME,
             self.autotune_mode_name(),
             self.autotune_generation,
@@ -261,10 +261,10 @@ impl Metrics {
             self.rt_sensitive_wakeups,
             self.rt_sensitive_local_enqueues,
             self.rt_sensitive_preempts,
-            self.stable_local_candidates,
-            self.stable_local_enqueues,
-            self.stable_local_rejections,
-            self.stable_local_mismatches,
+            self.direct_local_candidates,
+            self.direct_local_enqueues,
+            self.direct_local_rejections,
+            self.direct_local_mismatches,
             self.contained_enqueues,
             self.hog_containment_enqueues,
             self.hog_recoveries,
@@ -431,18 +431,18 @@ impl Metrics {
             shared_starved_head_enqueues: self
                 .shared_starved_head_enqueues
                 .wrapping_sub(rhs.shared_starved_head_enqueues),
-            stable_local_candidates: self
-                .stable_local_candidates
-                .wrapping_sub(rhs.stable_local_candidates),
-            stable_local_enqueues: self
-                .stable_local_enqueues
-                .wrapping_sub(rhs.stable_local_enqueues),
-            stable_local_rejections: self
-                .stable_local_rejections
-                .wrapping_sub(rhs.stable_local_rejections),
-            stable_local_mismatches: self
-                .stable_local_mismatches
-                .wrapping_sub(rhs.stable_local_mismatches),
+            direct_local_candidates: self
+                .direct_local_candidates
+                .wrapping_sub(rhs.direct_local_candidates),
+            direct_local_enqueues: self
+                .direct_local_enqueues
+                .wrapping_sub(rhs.direct_local_enqueues),
+            direct_local_rejections: self
+                .direct_local_rejections
+                .wrapping_sub(rhs.direct_local_rejections),
+            direct_local_mismatches: self
+                .direct_local_mismatches
+                .wrapping_sub(rhs.direct_local_mismatches),
             contained_enqueues: self
                 .contained_enqueues
                 .wrapping_sub(rhs.contained_enqueues),
