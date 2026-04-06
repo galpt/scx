@@ -18,9 +18,9 @@ running. Positive-budget work is favored ahead of the shared fallback path,
 while bounded adaptive tuning lets the scheduler move between balanced,
 latency-oriented, and throughput-oriented behavior without requiring constant
 manual retuning. The implementation combines reserved, latency, shared, and
-contained paths with bounded urgency, fairness, and locality mechanisms so the
-scheduler stays explainable and measurable instead of depending on large,
-open-ended heuristics.
+contained paths with bounded urgency, fairness, locality, and confidence
+signals so the scheduler stays explainable and measurable instead of depending
+on large, open-ended heuristics.
 
 ## Typical Use Case
 

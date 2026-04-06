@@ -274,8 +274,16 @@ impl RuntimeTunables {
             target.preempt_refill_min_ns,
             25 * 1000,
         );
-        changed |= step_u64(&mut self.latency_credit_grant, target.latency_credit_grant, 1);
-        changed |= step_u64(&mut self.latency_credit_decay, target.latency_credit_decay, 1);
+        changed |= step_u64(
+            &mut self.latency_credit_grant,
+            target.latency_credit_grant,
+            1,
+        );
+        changed |= step_u64(
+            &mut self.latency_credit_decay,
+            target.latency_credit_decay,
+            1,
+        );
         changed |= step_u64(
             &mut self.latency_debt_urgent_min,
             target.latency_debt_urgent_min,
@@ -437,12 +445,11 @@ impl AutoTuner {
                     && preempt_ratio > 0.65
                     && shared_ratio < 0.35
                     && global_ratio < 0.20));
-        let should_enter_latency_mode =
-            latency_dispatch_ratio > 0.40
-                || wake_preempt > 0
-                || shared_ratio > 0.45
-                || global_ratio > 0.35
-                || exhaustion_ratio > 0.30;
+        let should_enter_latency_mode = latency_dispatch_ratio > 0.40
+            || wake_preempt > 0
+            || shared_ratio > 0.45
+            || global_ratio > 0.35
+            || exhaustion_ratio > 0.30;
         let should_rebalance_mode = rescue_pressure
             && latency_dispatch_ratio < 0.40
             && shared_ratio < 0.45
@@ -662,6 +669,10 @@ impl<'a> Scheduler<'a> {
             direct_local_enqueues: bss_data.direct_local_enqueues,
             direct_local_rejections: bss_data.direct_local_rejections,
             direct_local_mismatches: bss_data.direct_local_mismatches,
+            ipc_wake_candidates: bss_data.ipc_wake_candidates,
+            ipc_local_enqueues: bss_data.ipc_local_enqueues,
+            ipc_score_raises: bss_data.ipc_score_raises,
+            ipc_boosts: bss_data.ipc_boosts,
             contained_enqueues: bss_data.contained_enqueues,
             hog_containment_enqueues: bss_data.hog_containment_enqueues,
             hog_recoveries: bss_data.hog_recoveries,
