@@ -28,6 +28,7 @@ struct task_ctx {
 	u32 containment_score;
 	u32 locality_score;
 	u32 ipc_confidence;
+	u32 wake_profile;
 	s32 last_cpu;
 	s32 wake_cpu;
 	bool wake_cpu_idle;
@@ -137,6 +138,22 @@ volatile u64 autotune_mode;
 #define CONTAINED_DSQ 1025
 #define SHARED_DSQ 1026
 
+enum wake_profile_bits {
+	WAKE_PROFILE_POSITIVE_BUDGET = 1U << 0,
+	WAKE_PROFILE_CONTAINMENT_ACTIVE = 1U << 1,
+	WAKE_PROFILE_LATENCY_ALLOWANCE = 1U << 2,
+	WAKE_PROFILE_LATENCY_PRESSURE = 1U << 3,
+	WAKE_PROFILE_LATENCY_LANE = 1U << 4,
+	WAKE_PROFILE_URGENT_LATENCY = 1U << 5,
+	WAKE_PROFILE_RT_SENSITIVE = 1U << 6,
+	WAKE_PROFILE_LOCALITY = 1U << 7,
+	WAKE_PROFILE_LOCALITY_FAST = 1U << 8,
+	WAKE_PROFILE_IPC = 1U << 9,
+	WAKE_PROFILE_IPC_STRONG = 1U << 10,
+	WAKE_PROFILE_PREEMPT_READY = 1U << 11,
+	WAKE_PROFILE_RESERVED_HEAD = 1U << 12,
+};
+
 static inline struct task_ctx *lookup_task_ctx(const struct task_struct *p)
 {
 	return bpf_task_storage_get(&task_ctx_stor,
@@ -242,6 +259,7 @@ static __always_inline void reset_task_ctx(struct task_ctx *tctx, u64 now, bool 
 	tctx->containment_score = 0;
 	tctx->locality_score = 0;
 	tctx->ipc_confidence = 0;
+	tctx->wake_profile = 0;
 	tctx->last_cpu = -1;
 	clear_wake_target(tctx);
 }
@@ -317,6 +335,21 @@ static __always_inline u32 decay_geometric_signal(u32 signal, u32 shift)
 		delta = 1;
 
 	return decay_bounded_signal(signal, delta);
+}
+
+static __always_inline u32 decay_confidence_signal(u32 signal, u32 delta,
+						   u32 shift)
+{
+	u32 decayed_signal;
+
+	if (!signal)
+		return 0;
+
+	decayed_signal = decay_geometric_signal(signal, shift);
+	if (delta > 1)
+		decayed_signal = decay_bounded_signal(decayed_signal, delta - 1);
+
+	return decayed_signal;
 }
 
 static __always_inline bool is_containment_active(const struct task_ctx *tctx)
@@ -422,12 +455,21 @@ static __always_inline void decay_latency_allowance(struct task_ctx *tctx, u32 d
 	if (!tctx || !delta)
 		return;
 
-	tctx->latency_allowance = decay_bounded_signal(tctx->latency_allowance, delta);
+	tctx->latency_allowance =
+		decay_confidence_signal(tctx->latency_allowance, delta,
+					FLOW_LATENCY_CREDIT_DECAY_SHIFT);
 }
 
 static __always_inline bool has_urgent_latency_pressure(const struct task_ctx *tctx)
 {
 	return tctx && tctx->latency_pressure >= tuned_latency_debt_urgent_min();
+}
+
+static __always_inline bool is_latency_allowance_candidate(const struct task_ctx *tctx)
+{
+	if (!tctx || tctx->budget_ns <= 0 || !tctx->latency_allowance)
+		return false;
+	return tctx->budget_ns >= (s64)FLOW_LATENCY_LANE_BUDGET_MIN_NS;
 }
 
 static __always_inline bool raise_latency_pressure(struct task_ctx *tctx, u32 delta)
@@ -458,7 +500,9 @@ static __always_inline bool decay_latency_pressure(struct task_ctx *tctx, u32 de
 	if (!old_pressure)
 		return false;
 
-	tctx->latency_pressure = decay_bounded_signal(old_pressure, delta);
+	tctx->latency_pressure =
+		decay_confidence_signal(old_pressure, delta,
+					FLOW_LATENCY_DEBT_DECAY_SHIFT);
 
 	return tctx->latency_pressure != old_pressure;
 }
@@ -491,7 +535,8 @@ static __always_inline void decay_locality_score(struct task_ctx *tctx, u32 delt
 		return;
 
 	tctx->locality_score =
-		decay_bounded_signal(tctx->locality_score, delta);
+		decay_confidence_signal(tctx->locality_score, delta,
+					FLOW_DIRECT_LOCAL_SCORE_DECAY_SHIFT);
 }
 
 static __always_inline bool has_ipc_confidence(const struct task_ctx *tctx, u32 min_score)
@@ -505,6 +550,11 @@ static __always_inline bool has_ipc_continuity_confidence(const struct task_ctx 
 {
 	return has_ipc_confidence(tctx, ipc_min_score) &&
 		has_locality_confidence(tctx, locality_min_score);
+}
+
+static __always_inline bool has_wake_profile(const struct task_ctx *tctx, u32 bit)
+{
+	return tctx && (tctx->wake_profile & bit);
 }
 
 static __always_inline void decay_ipc_confidence(struct task_ctx *tctx)
@@ -536,7 +586,9 @@ static __always_inline void decay_containment_score(struct task_ctx *tctx, u32 d
 		return;
 
 	old_score = tctx->containment_score;
-	tctx->containment_score = decay_bounded_signal(old_score, delta);
+	tctx->containment_score =
+		decay_confidence_signal(old_score, delta,
+					FLOW_HOG_SCORE_DECAY_SHIFT);
 
 	if (old_score >= FLOW_HOG_SCORE_CONTAIN &&
 	    tctx->containment_score < FLOW_HOG_SCORE_CONTAIN)
@@ -551,6 +603,115 @@ static __always_inline void raise_containment_score(struct task_ctx *tctx, u32 d
 	tctx->containment_score =
 		raise_bounded_signal(tctx->containment_score, delta,
 				   FLOW_HOG_SCORE_MAX);
+}
+
+static __always_inline void recompute_wake_profile(const struct task_struct *p,
+						   struct task_ctx *tctx)
+{
+	u32 wake_profile = 0;
+	bool allowance_ready = false;
+	bool pressure_ready = false;
+	bool latency_lane_ready = false;
+	bool rt_sensitive_ready = false;
+	bool preempt_ready = false;
+	bool containment_active;
+	bool positive_budget;
+	u64 preempt_refill_min_ns = tune_preempt_refill_min_ns;
+	u64 preempt_budget_min_ns = tune_preempt_budget_min_ns;
+
+	if (!tctx)
+		return;
+
+	containment_active = is_containment_active(tctx);
+	positive_budget = tctx->budget_ns > 0;
+
+	if (positive_budget)
+		wake_profile |= WAKE_PROFILE_POSITIVE_BUDGET;
+	if (containment_active)
+		wake_profile |= WAKE_PROFILE_CONTAINMENT_ACTIVE;
+
+	if (!positive_budget) {
+		tctx->wake_profile = wake_profile;
+		return;
+	}
+
+	if (preempt_refill_min_ns < FLOW_PREEMPT_REFILL_MIN_NS)
+		preempt_refill_min_ns = FLOW_PREEMPT_REFILL_MIN_NS;
+	else if (preempt_refill_min_ns > FLOW_PREEMPT_REFILL_MAX_NS)
+		preempt_refill_min_ns = FLOW_PREEMPT_REFILL_MAX_NS;
+
+	if (preempt_budget_min_ns < FLOW_PREEMPT_BUDGET_MIN_NS)
+		preempt_budget_min_ns = FLOW_PREEMPT_BUDGET_MIN_NS;
+	else if (preempt_budget_min_ns > FLOW_PREEMPT_BUDGET_MAX_NS)
+		preempt_budget_min_ns = FLOW_PREEMPT_BUDGET_MAX_NS;
+
+	allowance_ready = !containment_active &&
+		is_latency_allowance_candidate(tctx);
+	pressure_ready = !containment_active &&
+		has_urgent_latency_pressure(tctx);
+	rt_sensitive_ready = !containment_active &&
+		p->nr_cpus_allowed == 1 &&
+		tctx->last_refill_ns > 0 &&
+		tctx->last_refill_ns >= (s64)FLOW_INTERACTIVE_FLOOR_MIN_NS;
+	preempt_ready = !containment_active &&
+		(p->nr_cpus_allowed == 1 ||
+		 (tctx->last_refill_ns >= (s64)preempt_refill_min_ns &&
+		  tctx->budget_ns >= (s64)preempt_budget_min_ns));
+	latency_lane_ready = (allowance_ready || pressure_ready) &&
+		!rt_sensitive_ready;
+
+	if (allowance_ready)
+		wake_profile |= WAKE_PROFILE_LATENCY_ALLOWANCE;
+	if (pressure_ready)
+		wake_profile |= WAKE_PROFILE_LATENCY_PRESSURE;
+	if (latency_lane_ready)
+		wake_profile |= WAKE_PROFILE_LATENCY_LANE;
+	if (pressure_ready && latency_lane_ready)
+		wake_profile |= WAKE_PROFILE_URGENT_LATENCY;
+	if (rt_sensitive_ready)
+		wake_profile |= WAKE_PROFILE_RT_SENSITIVE;
+	if (preempt_ready)
+		wake_profile |= WAKE_PROFILE_PREEMPT_READY;
+
+	if (!containment_active &&
+	    has_locality_confidence(tctx, FLOW_DIRECT_LOCAL_SCORE_MIN))
+		wake_profile |= WAKE_PROFILE_LOCALITY;
+
+	if (!containment_active &&
+	    !rt_sensitive_ready &&
+	    !latency_lane_ready &&
+	    has_locality_confidence(tctx, FLOW_DIRECT_LOCAL_SCORE_MIN))
+		wake_profile |= WAKE_PROFILE_LOCALITY_FAST;
+
+	if (!containment_active &&
+	    p->nr_cpus_allowed <= FLOW_IPC_CPUS_MAX &&
+	    tctx->last_sleep_ns > 0 &&
+	    tctx->last_sleep_ns <= FLOW_IPC_SLEEP_MAX_NS &&
+	    tctx->budget_ns >= (s64)FLOW_IPC_REFILL_MIN_NS &&
+	    tctx->last_refill_ns >= (s64)FLOW_IPC_REFILL_MIN_NS &&
+	    has_ipc_continuity_confidence(tctx, FLOW_IPC_SCORE_ACTIVATE,
+					      FLOW_DIRECT_LOCAL_SCORE_GAIN))
+		wake_profile |= WAKE_PROFILE_IPC;
+
+	if (!containment_active &&
+	    p->nr_cpus_allowed == FLOW_IPC_CPUS_MAX &&
+	    tctx->last_sleep_ns > 0 &&
+	    tctx->last_sleep_ns <= FLOW_IPC_SLEEP_MAX_NS &&
+	    tctx->budget_ns >= (s64)FLOW_IPC_REFILL_MIN_NS &&
+	    tctx->last_refill_ns >= (s64)FLOW_IPC_REFILL_MIN_NS &&
+	    has_ipc_continuity_confidence(tctx,
+					      FLOW_IPC_SCORE_ACTIVATE + FLOW_IPC_SCORE_GAIN,
+					      FLOW_DIRECT_LOCAL_SCORE_MIN))
+		wake_profile |= WAKE_PROFILE_IPC_STRONG;
+
+	if (!containment_active &&
+	    !latency_lane_ready &&
+	    (rt_sensitive_ready ||
+	     (wake_profile & WAKE_PROFILE_LOCALITY_FAST) ||
+	     (wake_profile & WAKE_PROFILE_IPC)))
+		wake_profile |= WAKE_PROFILE_RESERVED_HEAD;
+
+	tctx->wake_profile = wake_profile;
 }
 
 static __always_inline void update_budget_on_wakeup(const struct task_struct *p,
@@ -599,31 +760,8 @@ static __always_inline void update_budget_on_wakeup(const struct task_struct *p,
 	    tctx->last_sleep_ns > FLOW_IPC_SLEEP_MAX_NS ||
 	    refill_ns < (s64)FLOW_IPC_REFILL_MIN_NS)
 		decay_ipc_confidence(tctx);
-}
 
-static __always_inline bool is_rt_sensitive_wakeup(const struct task_struct *p,
-						    const struct task_ctx *tctx,
-						    bool is_wakeup)
-{
-	if (!tctx || !is_wakeup)
-		return false;
-	if (p->nr_cpus_allowed != 1)
-		return false;
-	if (is_containment_active(tctx))
-		return false;
-	if (tctx->budget_ns <= 0)
-		return false;
-	if (tctx->last_refill_ns <= 0)
-		return false;
-
-	return tctx->last_refill_ns >= (s64)FLOW_INTERACTIVE_FLOOR_MIN_NS;
-}
-
-static __always_inline bool is_latency_allowance_candidate(const struct task_ctx *tctx)
-{
-	if (!tctx || tctx->budget_ns <= 0 || !tctx->latency_allowance)
-		return false;
-	return tctx->budget_ns >= (s64)FLOW_LATENCY_LANE_BUDGET_MIN_NS;
+	recompute_wake_profile(p, tctx);
 }
 
 static __always_inline bool is_ipc_confidence_candidate(const struct task_struct *p,
@@ -635,34 +773,20 @@ static __always_inline bool is_ipc_confidence_candidate(const struct task_struct
 							bool containment_active)
 {
 	s32 task_cpu;
-	bool strong_ipc_continuity;
 
 	if (!tctx || !is_wakeup)
 		return false;
 	if (containment_active || latency_lane_wakeup)
 		return false;
-	if (p->nr_cpus_allowed > FLOW_IPC_CPUS_MAX)
-		return false;
-	if (!has_ipc_continuity_confidence(tctx, FLOW_IPC_SCORE_ACTIVATE,
-					      FLOW_DIRECT_LOCAL_SCORE_GAIN))
+	if (!has_wake_profile(tctx, WAKE_PROFILE_IPC))
 		return false;
 	if (target_cpu < 0 || tctx->last_cpu < 0)
-		return false;
-	if (!tctx->last_sleep_ns || tctx->last_sleep_ns > FLOW_IPC_SLEEP_MAX_NS)
-		return false;
-	if (tctx->budget_ns < (s64)FLOW_IPC_REFILL_MIN_NS)
-		return false;
-	if (tctx->last_refill_ns < (s64)FLOW_IPC_REFILL_MIN_NS)
 		return false;
 
 	if (locality_hits_last_cpu(tctx, target_cpu))
 		return true;
 
-	strong_ipc_continuity = has_ipc_continuity_confidence(
-		tctx,
-		FLOW_IPC_SCORE_ACTIVATE + FLOW_IPC_SCORE_GAIN,
-		FLOW_DIRECT_LOCAL_SCORE_MIN);
-	if (!strong_ipc_continuity || p->nr_cpus_allowed != FLOW_IPC_CPUS_MAX)
+	if (!has_wake_profile(tctx, WAKE_PROFILE_IPC_STRONG))
 		return false;
 
 	task_cpu = scx_bpf_task_cpu(p);
@@ -682,19 +806,34 @@ static __always_inline bool is_locality_candidate(const struct task_ctx *tctx,
 {
 	if (!tctx || !is_wakeup)
 		return false;
-	if (containment_active || rt_sensitive_wakeup || latency_lane_wakeup)
-		return false;
-	if (tctx->budget_ns <= 0)
-		return false;
 	if (target_cpu < 0)
 		return false;
-	if (!has_locality_confidence(tctx, FLOW_DIRECT_LOCAL_SCORE_MIN))
+	if (containment_active || rt_sensitive_wakeup || latency_lane_wakeup)
+		return false;
+	if (!has_wake_profile(tctx, WAKE_PROFILE_LOCALITY_FAST))
 		return false;
 
 	if (locality_hits_last_cpu(tctx, target_cpu))
 		return true;
 
 	return wake_cpu_idle;
+}
+
+static __always_inline bool should_prioritize_reserved_enqueue(
+	const struct task_ctx *tctx, bool is_wakeup, bool containment_active,
+	bool latency_lane_wakeup, bool rt_sensitive_wakeup,
+	bool direct_local_wakeup, bool ipc_confidence_wakeup)
+{
+	if (!tctx || !is_wakeup)
+		return false;
+	if (containment_active || latency_lane_wakeup)
+		return false;
+	if (!has_wake_profile(tctx, WAKE_PROFILE_RESERVED_HEAD))
+		return false;
+	if (rt_sensitive_wakeup || direct_local_wakeup || ipc_confidence_wakeup)
+		return true;
+
+	return has_wake_profile(tctx, WAKE_PROFILE_LOCALITY_FAST);
 }
 
 static __always_inline bool allow_direct_local_fast_path(void)
@@ -876,22 +1015,26 @@ static __always_inline bool local_reserved_quota_active(struct flow_cpu_state *c
 		(cstate && cstate->shared_starvation_rounds > 0);
 }
 
-static __always_inline void note_locality_mismatch(struct task_ctx *tctx)
+static __always_inline void note_locality_mismatch(const struct task_struct *p,
+						   struct task_ctx *tctx)
 {
 	if (!tctx)
 		return;
 
 	__sync_fetch_and_add(&direct_local_mismatches, 1);
 	decay_locality_score(tctx, FLOW_DIRECT_LOCAL_MISMATCH_DECAY);
+	recompute_wake_profile(p, tctx);
 }
 
-static __always_inline void note_locality_rejection(struct task_ctx *tctx)
+static __always_inline void note_locality_rejection(const struct task_struct *p,
+						    struct task_ctx *tctx)
 {
 	if (!tctx)
 		return;
 
 	__sync_fetch_and_add(&direct_local_rejections, 1);
 	decay_locality_score(tctx, FLOW_DIRECT_LOCAL_MISMATCH_DECAY);
+	recompute_wake_profile(p, tctx);
 }
 
 static __always_inline bool should_promote_shared_enqueue(struct flow_cpu_state *cstate)
@@ -1044,7 +1187,7 @@ s32 BPF_STRUCT_OPS(flow_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wak
 		if (tctx->last_cpu >= 0 && tctx->wake_cpu == tctx->last_cpu)
 			__sync_fetch_and_add(&last_cpu_matches, 1);
 		else if (tctx->last_cpu >= 0)
-			note_locality_mismatch(tctx);
+			note_locality_mismatch(p, tctx);
 	}
 
 	return cpu >= 0 ? cpu : preferred_cpu;
@@ -1083,6 +1226,7 @@ void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 	bool direct_local_wakeup = false;
 	bool ipc_confidence_wakeup = false;
 	bool containment_active = false;
+	bool reserved_priority_wakeup = false;
 	bool use_local_reserved = false;
 	bool ordinary_local_reserved = false;
 
@@ -1121,28 +1265,28 @@ void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 
 	if (tctx) {
 		if (tctx->budget_ns > 0) {
-			containment_active = is_containment_active(tctx);
+			containment_active = has_wake_profile(
+				tctx, WAKE_PROFILE_CONTAINMENT_ACTIVE);
 			pressure_latency_wakeup = is_wakeup &&
-				!containment_active &&
-				has_urgent_latency_pressure(tctx);
+				has_wake_profile(tctx, WAKE_PROFILE_LATENCY_PRESSURE);
 			allowance_latency_wakeup = is_wakeup &&
-				!containment_active &&
-				is_latency_allowance_candidate(tctx);
+				has_wake_profile(tctx, WAKE_PROFILE_LATENCY_ALLOWANCE);
 			if (allowance_latency_wakeup || pressure_latency_wakeup) {
 				__sync_fetch_and_add(&latency_lane_candidates, 1);
 			}
-			if (containment_active && is_latency_allowance_candidate(tctx))
+			if (containment_active &&
+			    has_wake_profile(tctx, WAKE_PROFILE_LATENCY_ALLOWANCE))
 				__sync_fetch_and_add(&latency_candidate_hog_blocks, 1);
 			if (is_wakeup)
 				__sync_fetch_and_add(&positive_budget_wakeups, 1);
-			rt_sensitive_wakeup = is_rt_sensitive_wakeup(p, tctx, is_wakeup);
+			rt_sensitive_wakeup = is_wakeup &&
+				has_wake_profile(tctx, WAKE_PROFILE_RT_SENSITIVE);
 			if (rt_sensitive_wakeup)
 				__sync_fetch_and_add(&rt_sensitive_wakeups, 1);
-			latency_lane_wakeup =
-				(allowance_latency_wakeup || pressure_latency_wakeup) &&
-				!rt_sensitive_wakeup;
-			urgent_latency_wakeup = pressure_latency_wakeup &&
-				!rt_sensitive_wakeup;
+			latency_lane_wakeup = is_wakeup &&
+				has_wake_profile(tctx, WAKE_PROFILE_LATENCY_LANE);
+			urgent_latency_wakeup = is_wakeup &&
+				has_wake_profile(tctx, WAKE_PROFILE_URGENT_LATENCY);
 			ipc_confidence_wakeup = is_ipc_confidence_candidate(
 				p, tctx, target_cpu, tctx->wake_cpu_idle, is_wakeup,
 				latency_lane_wakeup, containment_active);
@@ -1156,7 +1300,7 @@ void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 								   containment_active);
 			if (direct_local_wakeup && !allow_direct_local_fast_path()) {
 				direct_local_wakeup = false;
-				note_locality_rejection(tctx);
+				note_locality_rejection(p, tctx);
 			}
 			if (direct_local_wakeup)
 				__sync_fetch_and_add(&direct_local_candidates, 1);
@@ -1166,29 +1310,14 @@ void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 
 			if (has_wake_target ||
 			    bpf_cpumask_test_cpu(target_cpu, p->cpus_ptr)) {
-				u64 preempt_refill_min_ns = tune_preempt_refill_min_ns;
-				u64 preempt_budget_min_ns = tune_preempt_budget_min_ns;
-				bool single_cpu_task = p->nr_cpus_allowed == 1;
 				bool should_preempt;
-
-				if (preempt_refill_min_ns < FLOW_PREEMPT_REFILL_MIN_NS)
-					preempt_refill_min_ns = FLOW_PREEMPT_REFILL_MIN_NS;
-				else if (preempt_refill_min_ns > FLOW_PREEMPT_REFILL_MAX_NS)
-					preempt_refill_min_ns = FLOW_PREEMPT_REFILL_MAX_NS;
-
-				if (preempt_budget_min_ns < FLOW_PREEMPT_BUDGET_MIN_NS)
-					preempt_budget_min_ns = FLOW_PREEMPT_BUDGET_MIN_NS;
-				else if (preempt_budget_min_ns > FLOW_PREEMPT_BUDGET_MAX_NS)
-					preempt_budget_min_ns = FLOW_PREEMPT_BUDGET_MAX_NS;
 
 				should_preempt = rt_sensitive_wakeup ||
 					ipc_confidence_wakeup ||
 					(is_wakeup &&
 					 !containment_active &&
 					 !tctx->wake_cpu_idle &&
-					 (single_cpu_task ||
-					  (tctx->last_refill_ns >= (s64)preempt_refill_min_ns &&
-					   tctx->budget_ns >= (s64)preempt_budget_min_ns)));
+					 has_wake_profile(tctx, WAKE_PROFILE_PREEMPT_READY));
 
 				use_local_reserved = should_preempt ||
 					direct_local_wakeup ||
@@ -1253,7 +1382,7 @@ void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 			}
 
 			if (direct_local_wakeup)
-				note_locality_rejection(tctx);
+				note_locality_rejection(p, tctx);
 
 			if (containment_active) {
 				if (should_promote_contained_enqueue(cstate)) {
@@ -1288,6 +1417,13 @@ void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 				clear_wake_target(tctx);
 				return;
 			}
+
+			reserved_priority_wakeup = should_prioritize_reserved_enqueue(
+				tctx, is_wakeup, containment_active, latency_lane_wakeup,
+				rt_sensitive_wakeup, direct_local_wakeup,
+				ipc_confidence_wakeup);
+			if (reserved_priority_wakeup)
+				enq_flags |= SCX_ENQ_HEAD;
 
 			scx_bpf_dsq_insert(p, RESERVED_DSQ, slice_ns, enq_flags);
 			reset_local_reserved_burst(cstate);
@@ -1507,6 +1643,7 @@ void BPF_STRUCT_OPS(flow_running, struct task_struct *p)
 		}
 		tctx->last_cpu = current_cpu;
 		tctx->last_run_at = now;
+		recompute_wake_profile(p, tctx);
 	}
 
 	__sync_fetch_and_add(&nr_running, 1);
@@ -1566,6 +1703,7 @@ void BPF_STRUCT_OPS(flow_stopping, struct task_struct *p, bool runnable)
 		tctx->sleep_started_at = runnable ? 0 : now;
 		if (!runnable)
 			clear_wake_target(tctx);
+		recompute_wake_profile(p, tctx);
 	}
 
 	__sync_fetch_and_add(&total_runtime, runtime_ns);
