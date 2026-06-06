@@ -57,6 +57,21 @@ volatile u64 tune_shared_slice_ns = FLOW_SLICE_SHARED_NS;
 volatile u64 tune_interactive_floor_ns = FLOW_INTERACTIVE_FLOOR_NS;
 volatile u64 autotune_generation;
 volatile u64 autotune_mode;
+volatile u64 has_hybrid_cpus;	/* non-zero when heterogeneous core capacities detected */
+
+/* Per-CPU core capacity, populated at init time.  On uniform-core
+ * systems all entries are 1024 and has_hybrid_cpus is 0.  On hybrid
+ * topologies the values are normalized to a [0, 1024] range (source
+ * can be cpu_capacity on ARM big.LITTLE, cpuinfo_max_freq on Intel
+ * hybrid, or amd_pstate_prefcore_ranking on AMD dual-CCD).  Used in
+ * select_cpu to bias latency-sensitive tasks toward higher-capacity
+ * CPUs. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 256);
+	__type(key, u32);
+	__type(value, u32);
+} cpu_capacity_map SEC(".maps");
 
 
 static u64 nr_cpu_ids;
@@ -331,6 +346,24 @@ s32 BPF_STRUCT_OPS(flow_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wak
 			cpu = scx_bpf_select_cpu_dfl(p, preferred_cpu, wake_flags, &is_idle);
 	} else {
 		cpu = scx_bpf_select_cpu_dfl(p, preferred_cpu, wake_flags, &is_idle);
+	}
+
+	/* On hybrid CPU topologies (P-cores + E-cores), bias tasks with
+	 * positive budget toward higher-capacity CPUs.  Exhausted tasks
+	 * (bulk workers) stay on whatever CPU was selected, avoiding
+	 * unnecessary migration that would hurt throughput. */
+	if (has_hybrid_cpus && tctx && tctx->budget_ns > 0 && cpu >= 0) {
+		s32 __cap_cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, FLOW_PICK_IDLE_CORE);
+		if (__cap_cpu >= 0) {
+			u32 __cur_key = (u32)cpu;
+			u32 __cap_key = (u32)__cap_cpu;
+			u32 *__cur_cap = bpf_map_lookup_elem(&cpu_capacity_map, &__cur_key);
+			u32 *__cap_val = bpf_map_lookup_elem(&cpu_capacity_map, &__cap_key);
+			if (__cur_cap && __cap_val && *__cap_val > *__cur_cap) {
+				cpu = __cap_cpu;
+				is_idle = true;
+			}
+		}
 	}
 
 	if (tctx) {

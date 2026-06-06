@@ -148,6 +148,92 @@ impl<'a> Scheduler<'a> {
 
         let mut skel = scx_ops_load!(skel, flow_ops, uei)?;
 
+        // Populate CPU capacity map from sysfs with multi-source fallback.
+        // On uniform-core systems all CPUs report the same capacity and
+        // has_hybrid_cpus stays 0, making the BPF path a no-op.  On hybrid
+        // Intel (Alder Lake / Raptor Lake), cpu_capacity may report 1024
+        // for both P-cores and E-cores (seen on some kernel versions), so
+        // we fall back to cpufreq/cpuinfo_max_freq which differs (~5.2 GHz
+        // P-core vs ~3.9 GHz E-core).  AMD dual-CCD (7950X3D) is detected
+        // via preferred-core ranking or CPPC highest_perf.  ARM big.LITTLE
+        // reports distinct values via cpu_capacity directly.
+        //
+        // Detection sources ordered from most precise to least
+        // (matching scx_utils::topology::get_capacity_source):
+        //   1. cpufreq/amd_pstate_prefcore_ranking  — AMD preferred core ranking
+        //   2. cpufreq/amd_pstate_highest_perf       — AMD pstate highest perf
+        //   3. acpi_cppc/highest_perf                 — ACPI CPPC highest perf
+        //   4. cpu_capacity                           — ARM big.LITTLE, some Intel
+        //   5. cpufreq/cpuinfo_max_freq               — Intel hybrid (Raptor Lake)
+        {
+            let capacity_sources = [
+                "cpufreq/amd_pstate_prefcore_ranking",
+                "cpufreq/amd_pstate_highest_perf",
+                "acpi_cppc/highest_perf",
+                "cpu_capacity",
+                "cpufreq/cpuinfo_max_freq",
+            ];
+
+            let mut chosen_source: Option<&str> = None;
+            let mut raw_vals: [u32; 256] = [0; 256];
+            let mut nr_online: u32 = 0;
+
+            for source in capacity_sources {
+                let mut min_raw = u32::MAX;
+                let mut max_raw: u32 = 0;
+                let mut any_found = false;
+
+                for cpu in 0..256_usize {
+                    let path = format!("/sys/devices/system/cpu/cpu{}/{}", cpu, source);
+                    if let Ok(s) = std::fs::read_to_string(&path) {
+                        if let Ok(val) = s.trim().parse::<u32>() {
+                            any_found = true;
+                            raw_vals[cpu] = val;
+                            if val < min_raw { min_raw = val; }
+                            if val > max_raw { max_raw = val; }
+                        }
+                    }
+                }
+
+                if any_found {
+                    nr_online = raw_vals.iter().filter(|&&v| v > 0).count() as u32;
+                    if min_raw < max_raw && max_raw > 0 {
+                        // Source differentiates cores — hybrid detected
+                        chosen_source = Some(source);
+                        // Normalize to [0, 1024] for the BPF map
+                        for cpu in 0..256_usize {
+                            let raw = raw_vals[cpu];
+                            let norm = if raw > 0 && max_raw > 0 {
+                                ((raw as u64) * 1024 / (max_raw as u64)) as u32
+                            } else {
+                                0
+                            };
+                            let key = (cpu as u32).to_ne_bytes();
+                            let val = norm.to_ne_bytes();
+                            let _ = skel.maps.cpu_capacity_map.update(
+                                &key, &val, libbpf_rs::MapFlags::ANY);
+                        }
+                        let bss = skel.maps.bss_data.as_mut().unwrap();
+                        bss.has_hybrid_cpus = 1;
+                        info!("CPU topology: hybrid cores detected via {} (raw {}–{}, {} online)",
+                              source, min_raw, max_raw, nr_online);
+                        break;
+                    }
+                }
+            }
+
+            if chosen_source.is_none() {
+                // Uniform or unrecognized topology — write 1024 for all CPUs
+                info!("CPU topology: uniform cores ({} online)", nr_online);
+                for cpu in 0..256_usize {
+                    let key = (cpu as u32).to_ne_bytes();
+                    let val = 1024u32.to_ne_bytes();
+                    let _ = skel.maps.cpu_capacity_map.update(
+                        &key, &val, libbpf_rs::MapFlags::ANY);
+                }
+            }
+        }
+
         let struct_ops = scx_ops_attach!(skel, flow_ops)?;
 
         // Expose live metrics for monitor and stats clients.
