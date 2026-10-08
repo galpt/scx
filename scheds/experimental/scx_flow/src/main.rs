@@ -1,36 +1,43 @@
 // SPDX-License-Identifier: GPL-2.0
-//
-// Copyright (c) 2026 Galih Tama <galpt@v.recipes>
-//
-// This software may be used and distributed according to the terms of the GNU
-// General Public License version 2.
+//! Flow scheduler front end.
+//!
+//! Copyright (c) 2026 Galih Tama <galpt@v.recipes>
+
+//! Loads the BPF object, seeds the topology view, then drives the loop.
+//! Observability is counters through the stats server plus the loopback
+//! dashboard with per CPU cards plus a JSON snapshot for debugging.
 
 mod bpf_skel;
-pub use bpf_skel::types;
 pub use bpf_skel::*;
 pub mod bpf_intf;
 pub use bpf_intf::*;
-
-mod carriage;
+#[path = "rust/config.rs"]
+mod config;
+#[path = "rust/snapshot.rs"]
+mod snapshot;
+#[path = "rust/stats.rs"]
 mod stats;
+#[path = "rust/topology.rs"]
+mod topology;
+#[path = "rust/webui.rs"]
 mod webui;
+
 use std::mem::MaybeUninit;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::CommandFactory;
 use clap::Parser;
-use clap_complete::generate;
 use clap_complete::Shell;
+use clap_complete::generate;
 use crossbeam::channel::RecvTimeoutError;
-use libbpf_rs::MapCore;
 use log::info;
 use scx_stats::prelude::*;
+use scx_utils::UserExitInfo;
 use scx_utils::build_id;
-use scx_utils::compat;
 use scx_utils::libbpf_clap_opts::LibbpfOpts;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
@@ -38,250 +45,218 @@ use scx_utils::scx_ops_open;
 use scx_utils::try_set_rlimit_infinity;
 use scx_utils::uei_exited;
 use scx_utils::uei_report;
-use scx_utils::UserExitInfo;
 
+use config::Config;
 use stats::Metrics;
 
+/* Binary name used in logs and stats. */
 const SCHEDULER_NAME: &str = "scx_flow";
+/* CPU bound shared with the BPF header. */
+#[cfg(test)]
+const MAX_CPUS: usize = crate::bpf_intf::flow_consts_FLOW_MAX_CPUS as usize;
 
 fn full_version() -> String {
     build_id::full_version(env!("CARGO_PKG_VERSION"))
 }
 
+/// Validated poll interval from float seconds.
+/// Rejects NaN plus infinite plus non-positive plus over one hour, so
+/// a bad flag fails closed before any timer starts with no panic.
+fn poll_interval_secs(v: f64) -> Result<Duration> {
+    if !v.is_finite() || v <= 0.0 || v > 3600.0 {
+        anyhow::bail!("interval bad {v}");
+    }
+    Ok(Duration::from_secs_f64(v))
+}
+
 #[derive(Debug, Parser)]
 #[command(name = SCHEDULER_NAME, version, disable_version_flag = true)]
 struct Opts {
+    /* Poll interval for the stats printer. */
     #[clap(long)]
     stats: Option<f64>,
-
+    /* Run the stats printer only. */
     #[clap(long)]
     monitor: Option<f64>,
-
-    #[clap(short, long, action = clap::ArgAction::SetTrue)]
+    /* Verbose BPF logging. */
+    #[clap(short = 'd', long, action = clap::ArgAction::SetTrue)]
     debug: bool,
-
+    /* Verbose output with libbpf detail. */
+    #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
+    verbose: bool,
+    /* Exit dump buffer length in bytes. */
+    #[clap(long, default_value = "1048576")]
+    exit_dump_len: u32,
+    /* Print version and exit. */
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
     version: bool,
-
-    #[clap(long = "no-webui", action = clap::ArgAction::SetTrue)]
-    no_webui: bool,
-
-    #[clap(long, action = clap::ArgAction::SetTrue)]
-    no_autotune: bool,
-
+    /* Show stat descriptions. */
+    #[clap(long)]
+    help_stats: bool,
+    /* Generate shell completions and exit. */
     #[clap(long, value_name = "SHELL", hide = true)]
     completions: Option<Shell>,
-
+    /* Disable the loopback dashboard thread. */
+    #[clap(long = "no-webui", action = clap::ArgAction::SetTrue)]
+    no_webui: bool,
     #[clap(flatten, next_help_heading = "Libbpf Options")]
     libbpf: LibbpfOpts,
 }
 
-struct Scheduler<'a> {
+/*
+ * Scheduler owns the skeleton, the link, the stats
+ * server plus the dashboard channel. It drives the run
+ * loop until shutdown or exit.
+ */
+pub(crate) struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
     stats_server: StatsServer<(), Metrics>,
-    webui_tx: Option<crossbeam::channel::Sender<stats::WebMetrics>>,
     started_at: std::time::Instant,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct CpuPolicyStateAgg {
-    budget_exhaustions: u64,
-    runnable_wakeups: u64,
-    cpu_migrations: u64,
+    /* Dashboard sender with None when disabled. */
+    webui_tx: Option<crossbeam::channel::Sender<stats::WebMetrics>>,
+    /* Online ids once at init in rank order. */
+    online_cpus: Vec<u32>,
+    /* SMT flag per online CPU in rank order for the cards. */
+    smt: Vec<bool>,
+    /* One line topology summary for the page. */
+    topology: String,
 }
 
 impl<'a> Scheduler<'a> {
-    fn read_cpu_policy_state(&self) -> CpuPolicyStateAgg {
-        let key = 0u32.to_ne_bytes();
-        let mut agg = CpuPolicyStateAgg::default();
-
-        let percpu_vals: Vec<Vec<u8>> = match self
-            .skel
-            .maps
-            .cpu_state
-            .lookup_percpu(&key, libbpf_rs::MapFlags::ANY)
-        {
-            Ok(Some(vals)) => vals,
-            _ => return agg,
-        };
-
-        for cpu_val in percpu_vals.iter() {
-            if cpu_val.len() < std::mem::size_of::<bpf_intf::flow_cpu_state>() {
-                continue;
-            }
-
-            let state = unsafe {
-                std::ptr::read_unaligned(cpu_val.as_ptr() as *const bpf_intf::flow_cpu_state)
-            };
-
-            agg.budget_exhaustions = agg
-                .budget_exhaustions
-                .saturating_add(state.budget_exhaustions);
-            agg.runnable_wakeups = agg.runnable_wakeups.saturating_add(state.runnable_wakeups);
-            agg.cpu_migrations = agg.cpu_migrations.saturating_add(state.cpu_migrations);
-        }
-
-        agg
-    }
-
     fn init(
         opts: &'a Opts,
         open_object: &'a mut MaybeUninit<libbpf_rs::OpenObject>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
         try_set_rlimit_infinity();
-
-        let mut skel_builder = BpfSkelBuilder::default();
-        skel_builder.obj_builder.debug(opts.debug);
-
+        let mut bld = BpfSkelBuilder::default();
+        bld.obj_builder.debug(opts.debug || opts.verbose);
         let open_opts = opts.libbpf.clone().into_bpf_open_opts();
-        let mut skel = scx_ops_open!(skel_builder, open_object, flow_ops, open_opts)?;
-
-        skel.struct_ops.flow_ops_mut().flags = *compat::SCX_OPS_ENQ_EXITING
-            | *compat::SCX_OPS_ENQ_LAST
-            | *compat::SCX_OPS_ENQ_MIGRATION_DISABLED
-            | *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP;
-
+        let mut skel = scx_ops_open!(bld, open_object, flow_ops, open_opts)?;
+        /* Validate the constants before load. */
+        let cfg = Config::default();
+        cfg.validate()?;
+        info!("Config: {}", cfg.describe());
+        /* Ops flags live in the BPF object for kernel 7.2 and up. */
+        skel.struct_ops.flow_ops_mut().exit_dump_len = opts.exit_dump_len;
         let mut skel = scx_ops_load!(skel, flow_ops, uei)?;
-
-        // Write scheduler PID to BSS so BPF can bypass the carriage.
-        {
-            let key: u32 = 0;
-            let mut bss_raw = skel
-                .maps
-                .bss
-                .lookup(&key.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            let pid_offset = std::mem::offset_of!(types::bss, flow_scheduler_pid);
-            let pid_bytes = (std::process::id() as u64).to_ne_bytes();
-            let bss_slice = bss_raw.as_mut_slice();
-            if pid_offset + 8 <= bss_slice.len() {
-                bss_slice[pid_offset..pid_offset + 8].copy_from_slice(&pid_bytes);
-            }
-            let _ = skel
-                .maps
-                .bss
-                .update(&key.to_ne_bytes(), &bss_raw, libbpf_rs::MapFlags::ANY);
-        }
-
-        // Discover topology and write into BSS.
-        carriage::init_topology(&mut skel)?;
-
+        let _ = &mut skel;
+        /* Seed the BPF topology view with sibling plus node rows. */
+        /* Failures keep the BPF defaults with node zero. */
+        let rows = topology::topo_rows();
+        Self::seed_topo_with(&mut skel, &rows);
         let struct_ops = scx_ops_attach!(skel, flow_ops)?;
-
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
-
-        let webui_tx: Option<crossbeam::channel::Sender<stats::WebMetrics>> = if !opts.no_webui {
-            let (tx, rx) = crossbeam::channel::unbounded::<stats::WebMetrics>();
-            let shutdown = shutdown.clone();
+        /* Bounded dashboard channel drops a frame when full. */
+        let webui_tx = if opts.no_webui {
+            None
+        } else {
+            let (tx, rx) = crossbeam::channel::bounded::<stats::WebMetrics>(16);
+            let sd = shutdown.clone();
             std::thread::spawn(move || {
-                webui::start(rx, shutdown);
+                webui::start(rx, sd);
             });
             Some(tx)
-        } else {
-            None
         };
-
+        let online_cpus: Vec<u32> = rows.iter().map(|(cpu, _, _)| *cpu).collect();
+        /* SMT flags cache the sibling view with no sysfs use on poll. */
+        let smt: Vec<bool> = rows
+            .iter()
+            .map(|(cpu, sib, _)| topology::is_smt_thread(*cpu, *sib))
+            .collect();
+        let topology = topology::describe_topology(&rows);
+        info!("Topology: {topology}");
         Ok(Self {
             skel,
             struct_ops: Some(struct_ops),
             stats_server,
-            webui_tx,
             started_at: std::time::Instant::now(),
+            webui_tx,
+            online_cpus,
+            smt,
+            topology,
         })
-    }
-
-    fn get_metrics(&self) -> Metrics {
-        let bss_data = self
-            .skel
-            .maps
-            .bss_data
-            .as_ref()
-            .expect("bss_data missing — BPF object has no .bss section");
-        let cpu_policy_state = self.read_cpu_policy_state();
-        Metrics {
-            on_cpu: bss_data.on_cpu,
-            total_runtime: bss_data.total_runtime,
-            uptime_ns: self.started_at.elapsed().as_nanos() as u64,
-
-            prio_dispatches: bss_data.prio_dispatches,
-            pinned_dispatches: bss_data.pinned_dispatches,
-
-            carriage_producer: bss_data.carriage_producer,
-
-            budget_exhaustions: bss_data.budget_exhaustions + cpu_policy_state.budget_exhaustions,
-            runnable_wakeups: bss_data.runnable_wakeups + cpu_policy_state.runnable_wakeups,
-            cpu_migrations: bss_data.cpu_migrations + cpu_policy_state.cpu_migrations,
-        }
-    }
-
-    fn get_web_metrics(&self) -> stats::WebMetrics {
-        let metrics = self.get_metrics();
-        let bss_data = self
-            .skel
-            .maps
-            .bss_data
-            .as_ref()
-            .expect("bss_data missing — BPF object has no .bss section");
-
-        let nr_cpus = bss_data.nr_cpu_ids as usize;
-        let mut per_cpu = Vec::with_capacity(nr_cpus);
-        for cpu in 0..nr_cpus {
-            if cpu >= 1024 {
-                break;
-            }
-            per_cpu.push(stats::PerCpuMetrics {
-                id: cpu as u32,
-                freq_khz: bss_data.per_cpu_max_freq_khz[cpu],
-                llc_id: bss_data.per_cpu_llc_id[cpu] as u32,
-                smt: bss_data.per_cpu_is_smt[cpu] != 0,
-            });
-        }
-
-        let closed_slot = (bss_data.carriage_producer.wrapping_sub(1) & 63) as usize;
-        let carriage_filling_count = if closed_slot < 64 {
-            bss_data.carriage_pool[closed_slot].count as u64
-        } else {
-            0
-        };
-
-        stats::WebMetrics {
-            stats: metrics,
-            per_cpu,
-            carriage_filling_count,
-        }
     }
 
     fn exited(&self) -> bool {
         uei_exited!(&self.skel, uei)
     }
 
+    /* Seed one topology row per CPU into the BPF view. */
+    /* Each row carries the thread sibling and the node id. */
+    /* A failed update keeps the BPF default with no trap. */
+    fn seed_topo_with(skel: &mut BpfSkel<'_>, rows: &[(u32, u32, u32)]) {
+        use libbpf_rs::MapCore;
+        for (cpu, sib, node) in rows {
+            let key = cpu.to_ne_bytes();
+            let mut val = [0u8; 8];
+            val[0..4].copy_from_slice(&sib.to_ne_bytes());
+            val[4..8].copy_from_slice(&node.to_ne_bytes());
+            if let Err(e) = skel
+                .maps
+                .topo_stor
+                .update(&key, &val, libbpf_rs::MapFlags::ANY)
+            {
+                log::warn!("topo seed failed for cpu {cpu}: {e}");
+            }
+        }
+    }
+
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let (res_ch, req_ch) = self.stats_server.channels();
-
+        /* Short tick keeps stats polls prompt while the page polls */
+        /* once per second, so most ticks only refresh the bound */
+        /* channel when the dashboard is on plus the queue has room. */
+        /* One BPF read serves both the stats reply plus the page. */
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
-            match req_ch.recv_timeout(Duration::from_millis(250)) {
+            match req_ch.recv_timeout(Duration::from_millis(100)) {
                 Ok(()) => {
-                    let m = self.get_metrics();
                     if let Some(ref tx) = self.webui_tx {
-                        let wm = self.get_web_metrics();
-                        let _ = tx.try_send(wm);
+                        if !tx.is_full() {
+                            let web = self.get_web_metrics();
+                            let stats = web.stats.clone();
+                            let _ = tx.try_send(web);
+                            res_ch.send(stats)?
+                        } else {
+                            res_ch.send(self.get_metrics())?
+                        }
+                    } else {
+                        res_ch.send(self.get_metrics())?
                     }
-                    res_ch.send(m)?;
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    if let Some(ref tx) = self.webui_tx {
-                        let wm = self.get_web_metrics();
-                        let _ = tx.try_send(wm);
+                    if let Some(ref tx) = self.webui_tx
+                        && !tx.is_full()
+                    {
+                        let web = self.get_web_metrics();
+                        let _ = tx.try_send(web);
                     }
                 }
                 Err(e) => Err(e)?,
             }
         }
-
+        let m = self.get_metrics();
+        info!(
+            "exit ins={} req={} done={} local={} node={} machine={} kick={} adm={} rej={} miss={} gate={} pkick={} pskip={} redrej={} redrec={} runtime={} oncpu={}",
+            m.inserts,
+            m.requeues,
+            m.completions,
+            m.local_moves,
+            m.node_moves,
+            m.machine_moves,
+            m.kicks,
+            m.admits,
+            m.rejects,
+            m.misses,
+            m.gate_rejects,
+            m.preempt_kicks,
+            m.preempt_skipped,
+            m.red_rejects,
+            m.red_reclaims,
+            m.total_runtime,
+            m.on_cpu,
+        );
         let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
     }
@@ -289,7 +264,6 @@ impl<'a> Scheduler<'a> {
 
 fn main() -> Result<()> {
     let opts = Opts::parse();
-
     if let Some(shell) = opts.completions {
         generate(
             shell,
@@ -299,15 +273,16 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
-
-    let monitor_only = opts.monitor.is_some();
-
+    let only = opts.monitor.is_some();
     if opts.version {
         println!("{} {}", SCHEDULER_NAME, full_version());
         return Ok(());
     }
-
-    if !monitor_only {
+    if opts.help_stats {
+        println!("stats: top");
+        return Ok(());
+    }
+    if !only {
         simplelog::SimpleLogger::init(
             if opts.debug {
                 simplelog::LevelFilter::Debug
@@ -316,37 +291,126 @@ fn main() -> Result<()> {
             },
             simplelog::Config::default(),
         )?;
-
         info!("{} {}", SCHEDULER_NAME, full_version());
         info!("Starting {} scheduler", SCHEDULER_NAME);
     }
-
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-
+    let sd = shutdown.clone();
     ctrlc::set_handler(move || {
-        shutdown_clone.store(true, Ordering::Relaxed);
+        sd.store(true, Ordering::Relaxed);
     })?;
-
     if let Some(intv) = opts.monitor.or(opts.stats) {
-        let monitor_shutdown = shutdown.clone();
+        let dur = poll_interval_secs(intv)?;
+        let sd = shutdown.clone();
         let jh = std::thread::spawn(move || {
-            if let Err(err) = stats::monitor(Duration::from_secs_f64(intv), monitor_shutdown) {
-                log::warn!("stats monitor thread finished with error: {err}");
+            if let Err(e) = stats::monitor(dur, sd) {
+                log::warn!("monitor failed: {e}");
             }
         });
-
-        if monitor_only {
+        if only {
             let _ = jh.join();
             return Ok(());
         }
     }
-
     let mut open_object = MaybeUninit::<libbpf_rs::OpenObject>::uninit();
     let mut sched = Scheduler::init(&opts, &mut open_object, shutdown.clone())?;
     sched.run(shutdown)?;
-
     info!("Scheduler exited");
-
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduler_name_is_flow() {
+        assert_eq!(SCHEDULER_NAME, "scx_flow");
+        assert!(poll_interval_secs(1.0).is_ok());
+        assert!(poll_interval_secs(0.0).is_err());
+        assert!(poll_interval_secs(-1.0).is_err());
+        assert!(poll_interval_secs(f64::NAN).is_err());
+        assert!(poll_interval_secs(f64::INFINITY).is_err());
+        assert!(poll_interval_secs(3601.0).is_err());
+    }
+
+    #[test]
+    fn max_cpus_matches_header() {
+        assert_eq!(
+            MAX_CPUS,
+            crate::bpf_intf::flow_consts_FLOW_MAX_CPUS as usize
+        );
+    }
+
+    #[test]
+    fn quantum_matches_header() {
+        assert_eq!(
+            crate::config::QUANTUM_NS,
+            crate::bpf_intf::flow_consts_FLOW_QUANTUM_NS as u64
+        );
+        assert_eq!(crate::config::QUANTUM_NS, 1_000_000);
+        assert_eq!(crate::config::WEIGHT_BASE, 128);
+        assert_eq!(crate::config::WEIGHT_MIN, 1);
+        assert_eq!(crate::config::WEIGHT_MAX, 16_384);
+    }
+
+    #[test]
+    fn slot_matches_header() {
+        assert_eq!(crate::bpf_intf::flow_consts_FLOW_MACHINE as u64, 0x5A00);
+        assert_eq!(crate::bpf_intf::flow_consts_FLOW_OVERFLOW as u64, 0x5A01);
+        assert_eq!(crate::bpf_intf::flow_consts_FLOW_MAX_DSQS as u64, 1042);
+    }
+
+    #[test]
+    fn period_matches_header() {
+        assert_eq!(
+            crate::config::PERIOD_NS,
+            crate::bpf_intf::flow_consts_FLOW_PERIOD_NS as u64
+        );
+        assert_eq!(crate::config::PERIOD_NS, 16_000_000);
+    }
+
+    #[test]
+    fn task_size_is_72() {
+        assert_eq!(std::mem::size_of::<crate::bpf_intf::flow_task_ctx>(), 72);
+    }
+
+    #[test]
+    fn cpu_size_is_16() {
+        assert_eq!(std::mem::size_of::<crate::bpf_intf::flow_cpu_state>(), 16);
+    }
+
+    #[test]
+    fn topo_size_is_8() {
+        assert_eq!(std::mem::size_of::<crate::bpf_intf::flow_topo>(), 8);
+    }
+
+    #[test]
+    fn sched_stats_size_is_136() {
+        assert_eq!(
+            std::mem::size_of::<crate::bpf_intf::flow_sched_stats>(),
+            136
+        );
+    }
+
+    #[test]
+    fn kick_rule_matches_header() {
+        assert_eq!(
+            crate::bpf_intf::flow_consts_FLOW_PREEMPT_MARGIN_NS as u64,
+            100_000
+        );
+        assert_eq!(
+            crate::bpf_intf::flow_consts_FLOW_PREEMPT_TAIL_NS as u64,
+            100_000
+        );
+    }
+
+    #[test]
+    fn hint_matches_header() {
+        assert_eq!(
+            crate::config::HINT_MAX,
+            crate::bpf_intf::flow_consts_FLOW_HINT_MAX as u64
+        );
+        assert_eq!(crate::config::HINT_MAX, 8192);
+    }
 }

@@ -1,27 +1,34 @@
 // SPDX-License-Identifier: GPL-2.0
-// Copyright (c) 2026 Galih Tama <galpt@v.recipes>
-//
-// This software may be used and distributed according to the terms of the
-// GNU General Public License version 2.
+/*
+ * Build helper
+ *
+ * Adds a warning suppression for the generated kernel header
+ * and then builds the BPF object and the userspace bindings.
+ *
+ * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
+ */
 
 fn add_bpf_warning_suppression(flag: &str) {
     const KEY: &str = "BPF_EXTRA_CFLAGS_POST_INCL";
-
-    match std::env::var(KEY) {
+    let value = match std::env::var(KEY) {
         Ok(existing) => {
-            if !existing.split_whitespace().any(|entry| entry == flag) {
-                std::env::set_var(KEY, format!("{existing} {flag}"));
+            if existing.split_whitespace().any(|entry| entry == flag) {
+                return;
             }
+            format!("{existing} {flag}")
         }
-        Err(_) => std::env::set_var(KEY, flag),
+        Err(_) => flag.to_owned(),
+    };
+    /* SAFETY: build script runs single threaded. */
+    unsafe {
+        std::env::set_var(KEY, value);
     }
 }
 
 fn main() {
-    // clang can warn about forward declarations inside generated vmlinux.h.
-    // Those are not actionable for scx_flow and just add noise for builders.
+    /* The generated header may warn about declarations. */
+    /* The warning is not actionable for this scheduler. */
     add_bpf_warning_suppression("-Wno-missing-declarations");
-
     scx_cargo::BpfBuilder::new()
         .unwrap()
         .enable_intf("src/bpf/intf.h", "bpf_intf.rs")

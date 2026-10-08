@@ -1,21 +1,77 @@
 # scx_flow
 
-This is a single user-defined scheduler used within [`sched_ext`](https://github.com/sched-ext/scx/tree/main), which is a Linux kernel feature that enables implementing kernel thread schedulers in BPF and dynamically loading them. [Read more about `sched_ext`](https://github.com/sched-ext/scx/tree/main).
+### What is it?
 
-## Overview
+scx_flow runs the earliest strict key first as the earlier of deadline plus virtual time. It adds [RED](https://web.cs.umass.edu/publication/docs/1993/UM-CS-1993-025.pdf) admission with guarantee-only tolerance plus three PRIQ tiers with insert vtime plus a value ordered reject queue outside dispatch plus reclaim on global completer credit with tiers-empty fallback plus aged cover. See `src/bpf/intf.h` and `src/bpf/edf.bpf.c`.
 
-`scx_flow` is a budget-driven `sched_ext` scheduler with zero heuristic classification. Tasks accumulate budget while sleeping and spend it while running. Non-wakeup re-enqueues enter the **Waiting Room** — per-CPU vtime-ordered DSQs where each task receives an equal share of its target CPU's bandwidth: `FLOW_CARRIAGE_NS / tasks_on_cpu`, clamped to [50µs, 2ms]. Slices adjust dynamically as tasks arrive on the same core. Wakeups are dispatched immediately to the target CPU via `SCX_DSQ_LOCAL_ON`.
+### Why?
 
-## Typical Use Case
+The goal is to test strict order with prediction in the kernel and see if short bursts reach a CPU sooner. See `src/bpf/intf.h`.
 
-Systems where scheduling decisions must be deterministic and explainable: embedded control, robotics, avionics, automotive, and other mission-critical workloads. The fair-share slice model ensures each task receives an equal portion of its target core's bandwidth, preventing both starvation and priority inversion.
+### How it works?
 
-General-purpose desktop and workstation use is also supported; interactive tasks (longer sleep → higher budget → longer slice) are naturally separated from bulk workers without requiring configuration or heuristics.
+Arrivals pass a gate first, then pass RED with residual plus exceed plus tolerance for the guarantee alone. A zero exceed admits, a critical exceed admits with no swap, else a bounded O(1) newcomer test still decides. Each CPU takes the earliest key it may run. See `src/bpf/enqueue.bpf.c` and `src/bpf/dispatch.bpf.c`.
 
-## Web UI
+## Typical Use Cases
 
-When scx_flow starts, it serves a live dashboard at `http://[::1]:50005/` or via Unix socket at `/tmp/scx_flow.sock`. The dashboard shows per-core cards (CPU ID, max frequency, LLC, SMT status), the Waiting Room carriage pool (producer slot index, filling count, 64-slot grid), and system statistics (on-CPU count, wake/pinned dispatches, budget exhaustions, CPU migrations). Values update every second. Disable with `--no-webui`.
+- Latency-sensitive applications.
+- General desktop use.
+- Mixed batch workloads.
 
-## Production Ready?
+## More details
 
-Yes, for the use cases described above.
+### Queues
+
+Local plus node plus machine plus reject hold tasks across 1042 queues. Each pass drains three PRIQ tiers plus steal with one move capped by slots and 8 visits plus one reclaim when empty plus aged past one period. Reject stays strictly value ordered outside dispatch still with overflow name for wire compat. See `src/bpf/intf.h`.
+
+### Keys
+
+Each strict key sets queue rank with vruntime pacing via lag bounds. Predictor shapes deadlines with shift updates. Virtual deadline adds dynamic slice over weight with one divide. Strict key holds earlier of deadline plus virtual deadline with 2ms clamp still. Remaining feeds slice plus slack only now. See `src/bpf/intf.h`.
+
+### Admission
+
+RED checks residual from deadline minus cost plus tolerance of zero for critical else `64us`. Newcomer victim needs cost past `128us` plus past exceed plus never critical, else admits. Newcomer-pays trades exact choice for bounded O(1) admission still and tiers-empty plus aged reclaim bounds starvation with no drop. See `src/bpf/edf.bpf.c` and `src/rust/config.rs`.
+
+### Gates
+
+A gate runs first so tasks and CPUs wait. Exiting work runs at once with no wait and no gate. Fails join the value ordered reject queue with no leak. Drain stays gated with mask wins. Eligibility gates every kick, so hogs pace while lagging tasks still wake. See `src/bpf/cgroup.bpf.c`.
+
+### Reporting
+
+Flags `--stats`, `--monitor`, and `--no-webui` show counters as text or page at `50005`. Page keeps local, node, machine, kicks, preempt, plus RED rejects plus reclaims. Snapshots share one moment with times plus topology. Dashboard shows seventeen counters plus uptime with CPU cards plus five key merged JSON intact. See `src/rust/stats.rs`.
+
+### Fairness
+
+Strict order holds the earlier of deadline plus virtual deadline in each queue. Vruntime advances by slice over weight with lag clamp. Sleepers gain one slice of boost with no storm. Adaptive steps change the slice with no virtual change. Hierarchy stays flat with no share past weight. See `src/bpf/intf.h`.
+
+### Weights
+
+Weight tunes period bands. Shares map to 32ms, 16ms, 8ms, 4ms periods with shares 32, 64, 256, and 1024. Effective share stacks task times hint over 128 with zero mapped to 128. Heavy tasks earn near keys, light tasks earn far keys. Value holds weight with top critical. See `src/bpf/cgroup.bpf.c`.
+
+### Locality
+
+Locality stays with per-CPU plus per-node queues. Select takes prev idle, then waker and sibling idle, before the pick, so pairs share cache still. Placement keeps the slowest sufficient CPU with prev tie plus near minimum now. Two-way SMT assumed. Span equals online CPUs with no hotplug use. See `src/bpf/select_cpu.bpf.c`.
+
+### Contention
+
+Contention stays still bounded with 8 visits per pass shared across three PRIQ tiers plus steal. Each tier moves one task by slots. Steal scans 4 to 8 peers node-local first. Reclaim moves one reject when tiers hold no work plus aged past one period. Twelve peers cover one percent on 1024 CPUs. See `src/bpf/dispatch.bpf.c`.
+
+### Inversion
+
+Mask wins bound inversion with fail open. Each move checks the CPU mask and picks time first, so heads skip to the next task and tier. Reject stays outside dispatch with reclaim on same key or after. Local on stays terminal at three sites with no global use. See `src/bpf/dispatch.bpf.c`.
+
+### Staleness
+
+Staleness heals with retrain plus minimum fold. Each stop feeds average plus deviation plus credit. Yields keep carry to `10us` plus `1ms` when critical plus wall meets, else `64us` up on wall miss else `128us` down. Misses stay lifetime, adapt streak stays window. Reclaim reserves credit past `128us` with fallback when tiers hold no work. See `src/bpf/lifecycle.bpf.c`.
+
+## Code map
+
+- Rules live in `src/bpf/intf.h` with RED plus adapt helpers.
+- Core lives in cgroup, weight, vtime, edf, placement, select, enqueue, preempt, dispatch, lifecycle, stats, and timer, with select plus enqueue split.
+- Init lives in main plus topology still.
+- Dashboard lives in snapshot, stats, topology, webui, and ui now even today still.
+
+## Limitations
+
+- Hotplug needs restart.
+- Needs kernel `7.2` or newer.
