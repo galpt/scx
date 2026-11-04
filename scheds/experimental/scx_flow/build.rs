@@ -4,6 +4,7 @@
  *
  * Adds a warning suppression for the generated kernel header
  * and then builds the BPF object and the userspace bindings.
+ * Links only allowlisted upstream libs with the upstream pair queue.
  *
  * Copyright (c) 2026 Galih Tama <galpt@v.recipes>
  */
@@ -33,6 +34,17 @@ fn main() {
         .unwrap()
         .enable_intf("src/bpf/intf.h", "bpf_intf.rs")
         .enable_skel("src/bpf/main.bpf.c", "bpf")
-        .build()
+        .add_source("src/bpf/lib/arena.bpf.c")
+        .add_source("src/bpf/lib/common.bpf.c")
+        .add_source("src/bpf/lib/atq.bpf.c")
+        .add_source("src/bpf/lib/dhq.bpf.c")
+        .add_source("src/bpf/lib/bitmap.bpf.c")
+        .add_source("src/bpf/lib/cpumask.bpf.c")
+        .add_source("src/bpf/lib/minheap.bpf.c")
+        .add_source("src/bpf/lib/rbtree.bpf.c")
+        .add_source("src/bpf/lib/sdt_alloc.bpf.c")
+        .add_source("src/bpf/lib/sdt_task.bpf.c")
+        .add_source("src/bpf/lib/topology.bpf.c")
+        .compile_link_gen()
         .unwrap();
 }
